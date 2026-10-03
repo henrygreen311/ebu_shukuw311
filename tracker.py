@@ -12,13 +12,19 @@ from urllib.parse import urlparse
 
 # Bybit and KuCoin block datacenter IPs, so they route through a PHP relay on
 # our own domain instead of hitting the exchange API directly.
+#
+# The relay contract (see proxy.php) is:
+#   GET/POST  https://arb-bot.infinityfree.io/proxy.php/<exchange>/<rest>?<query>
+#   Header:   X-Proxy-Target-Host: <real exchange host>   (required)
+#   Header:   X-Proxy-Exchange:    <exchange id>          (optional, for logs)
+#   Cookies:  __test=<value>                              (InfinityFree bot-check)
 PROXY_BASE = "https://arb-bot.infinityfree.io/proxy.php"
 PROXY_EXCHANGES = {'Bybit', 'KuCoin'}
 PROXY_EXCHANGE_IDS = {name.lower() for name in PROXY_EXCHANGES}
 
-# Some exchanges need a region-specific hostname. OKX in particular rejects
-# API keys issued on a different regional domain with error code 50119
-# ("API key doesn't exist"). Uncomment the one that matches your account:
+# Some exchanges need a region-specific hostname. OKX rejects API keys issued
+# on a different regional domain with error code 50119
+# ("API key doesn't exist"). Uncomment the line that matches your account:
 #
 #   EEA (Europe)  -> eea.okx.com
 #   US            -> us.okx.com
@@ -156,8 +162,11 @@ TIMEOUT_MS = 10_000
 def ccxt_config(exchange_id_lower, default_type=None):
     """
     Build a ccxt config dict for the given exchange id.
+
     `default_type` (e.g. 'spot', 'swap') is optional; when given it forces
     the adapter to use that market type instead of its own default.
+    Regional hostname overrides are applied here from
+    EXCHANGE_HOSTNAME_OVERRIDES.
     """
     proxied = exchange_id_lower in PROXY_EXCHANGE_IDS
     cfg = {
@@ -252,6 +261,8 @@ EXCHANGE_BUILDERS = {
     'MEXC':    lambda: ccxt.mexc(ccxt_config('mexc')),
     'BingX':   lambda: ccxt.bingx(ccxt_config('bingx')),
     'KuCoin':  _build_kucoin,
+    # CoinEx needs defaultType='spot' — otherwise its ccxt adapter returns
+    # _INDEX / derivative markets and every symbol gets filtered out.
     'CoinEx':  lambda: ccxt.coinex(ccxt_config('coinex', default_type='spot')),
     'BitMart': lambda: ccxt.bitmart(ccxt_config('bitmart')),
     'OKX':     lambda: ccxt.okx(ccxt_config('okx')),
@@ -259,9 +270,11 @@ EXCHANGE_BUILDERS = {
 }
 
 # Per-exchange extra params for fetch_tickers / fetch_order_book.
+# CoinEx wants `type: 'spot'` explicitly so the adapter does not default to
+# the derivative markets it would otherwise return.
 EXTRA_PARAMS = {
     'Bybit':  {'category': 'spot'},
-    'CoinEx': {'type': 'spot'},  # Redundant safety net
+    'CoinEx': {'type': 'spot'},
 }
 
 EXCHANGES = {}
@@ -300,24 +313,24 @@ def get_usdt_tickers(name):
     if ex is None:
         return {}
     params = EXTRA_PARAMS.get(name, {})
-
-    # Explicitly pass the market type for CoinEx. This is the definitive fix
-    # for the adapter ignoring the constructor's defaultType setting.
-    if name == 'CoinEx':
-        params = {'type': 'spot'}
-
     try:
         tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
     except Exception as e:
+        # Wider truncation so exchange error bodies (BitMart/OKX) show up.
         log.warning(f"  WARNING  {name}: {str(e)[:800]}")
         EXCHANGES[name] = None
         return {}
     markets = getattr(ex, 'markets', None) or {}
     result = {}
     for symbol, t in tickers.items():
+        # Accept only true spot pairs. Excludes CoinEx's 'FTTUSDT_INDEX' and
+        # similar derivative/index names as well as any non-slash format.
         if not symbol.endswith('/USDT'):
             continue
         base_asset = symbol.split('/')[0].upper()
+        # Reject any base asset containing an underscore or ending in INDEX —
+        # covers _INDEX, _PERP, _FUTURES, and similar derivative suffixes
+        # regardless of what market type the adapter returned.
         if '_' in base_asset or base_asset.endswith('INDEX'):
             continue
         last = t.get('last')
@@ -1571,7 +1584,7 @@ def main():
     if missing:
         log.warning(
             f"  WARNING  ccxt is missing classes for: {', '.join(missing)}  |  "
-            f"run: pip install -U ccxt"
+            f"run: pip install -r requirements.txt --force-reinstall"
         )
 
     log.info(f"Exchanges : {', '.join(EXCHANGE_BUILDERS.keys())}")
