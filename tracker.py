@@ -22,6 +22,18 @@ PROXY_BASE = "https://arb-bot.infinityfree.io/proxy.php"
 PROXY_EXCHANGES = {'Bybit', 'KuCoin'}
 PROXY_EXCHANGE_IDS = {name.lower() for name in PROXY_EXCHANGES}
 
+# Some exchanges need a region-specific hostname. OKX in particular rejects
+# API keys issued on a different regional domain with error code 50119
+# ("API key doesn't exist"). Uncomment the one that matches your account:
+#
+#   EEA (Europe)  -> eea.okx.com
+#   US            -> us.okx.com
+#   Global        -> www.okx.com  (default, no override needed)
+EXCHANGE_HOSTNAME_OVERRIDES = {
+    # 'okx': 'eea.okx.com',
+    # 'okx': 'us.okx.com',
+}
+
 # Only browser-fingerprint headers. Do NOT set Accept here — let ccxt's own
 # `Accept: application/json` reach the exchange through the relay.
 _PROXY_HEADERS = {
@@ -165,6 +177,10 @@ def ccxt_config(exchange_id_lower, default_type=None):
     if default_type is not None:
         cfg['options']['defaultType'] = default_type
 
+    hostname_override = EXCHANGE_HOSTNAME_OVERRIDES.get(exchange_id_lower)
+    if hostname_override:
+        cfg['hostname'] = hostname_override
+
     creds = CREDENTIALS.get(exchange_id_lower)
     if creds:
         if creds.get('apiKey'):
@@ -264,6 +280,10 @@ EXCHANGES = {}
 def ensure_exchange(name):
     if EXCHANGES.get(name) is not None:
         return EXCHANGES[name]
+    if name not in EXCHANGE_BUILDERS:
+        log.warning(f"  WARNING  {name}: no builder registered")
+        EXCHANGES[name] = None
+        return None
     try:
         ex = with_retries(EXCHANGE_BUILDERS[name], name)
     except Exception as e:
@@ -294,7 +314,8 @@ def get_usdt_tickers(name):
     try:
         tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
     except Exception as e:
-        log.warning(f"  WARNING  {name}: {str(e)[:400]}")
+        # Wider truncation so exchange error bodies (BitMart/OKX) show up.
+        log.warning(f"  WARNING  {name}: {str(e)[:800]}")
         EXCHANGES[name] = None
         return {}
     markets = getattr(ex, 'markets', None) or {}
@@ -305,7 +326,10 @@ def get_usdt_tickers(name):
         if not symbol.endswith('/USDT'):
             continue
         base_asset = symbol.split('/')[0].upper()
-        if base_asset.endswith('_INDEX') or base_asset.endswith('INDEX'):
+        # Reject any base asset containing an underscore or ending in INDEX —
+        # covers _INDEX, _PERP, _FUTURES, and similar derivative suffixes
+        # regardless of what market type the adapter returned.
+        if '_' in base_asset or base_asset.endswith('INDEX'):
             continue
         last = t.get('last')
         if not last or last <= 0:
@@ -564,7 +588,7 @@ def get_currencies(exchange_name):
             data = ex.fetch_currencies() or {}
             data = _sanitize_currencies(data)
         except Exception as e:
-            log.warning(f"  WARNING  {exchange_name} currencies: {str(e)[:120]}")
+            log.warning(f"  WARNING  {exchange_name} currencies: {str(e)[:300]}")
             data = {}
         if not data and cached:
             data = cached['data']
@@ -1539,7 +1563,7 @@ def scan_once(scan_num):
             try:
                 tickers = future.result()
             except Exception as e:
-                log.warning(f"  WARNING  {name}: {str(e)[:400]}")
+                log.warning(f"  WARNING  {name}: {str(e)[:800]}")
                 tickers = {}
             all_tickers[name] = tickers
             counts[name]      = len(tickers)
@@ -1552,6 +1576,15 @@ def scan_once(scan_num):
 
 def main():
     log.info("Crypto Arb Scanner started")
+    log.info(f"ccxt version: {ccxt.__version__}")
+
+    missing = [n for n in EXCHANGE_BUILDERS if not hasattr(ccxt, n.lower())]
+    if missing:
+        log.warning(
+            f"  WARNING  ccxt is missing classes for: {', '.join(missing)}  |  "
+            f"run: pip install -U ccxt"
+        )
+
     log.info(f"Exchanges : {', '.join(EXCHANGE_BUILDERS.keys())}")
     log.info(f"Gap range : {MIN_GAP_PERCENT}% - {MAX_GAP_PERCENT}%")
     log.info(f"Min volume: ${MIN_VOLUME_USDT:,} USDT")
