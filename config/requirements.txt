@@ -1,5 +1,5 @@
 httpx[http2]>=0.27.0
 supabase>=2.9.0
-ccxt>=4.4.50
+ccxt>=4.5.85
 brotli>=1.1.0
 requests>=2.32.0
