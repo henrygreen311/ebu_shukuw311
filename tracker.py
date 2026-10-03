@@ -20,6 +20,13 @@ from urllib.parse import urlparse
 #   Cookies:  __test=<value>                              (InfinityFree bot-check)
 PROXY_BASE = "https://arb-bot.infinityfree.io/proxy.php"
 PROXY_EXCHANGES = {'Bybit', 'KuCoin'}
+# Set True if this machine cannot resolve api-cloud.bitmart.com at all
+# (NameResolutionError). Requests then go through the PHP relay, which
+# resolves DNS on its own side. The relay needs a 'bitmart' row in Supabase
+# api_keys with the InfinityFree cookie, same as bybit/kucoin.
+BITMART_USE_PROXY = False
+if BITMART_USE_PROXY:
+    PROXY_EXCHANGES.add('BitMart')
 PROXY_EXCHANGE_IDS = {name.lower() for name in PROXY_EXCHANGES}
 
 # Some exchanges need a region-specific hostname. OKX rejects API keys issued
@@ -275,12 +282,25 @@ def _build_kucoin():
     return ex
 
 def _build_bitmart():
-    ex = ccxt.bitmart(ccxt_config('bitmart'))
-    # ccxt's load_markets() also calls fetch_currencies() (/account/v1/currencies)
-    # and any failure there aborts fetch_tickers() too. Tickers/markets don't need
-    # it, and get_currencies() fetches currencies separately with its own
-    # error handling and cache, so keep it out of the market-loading path.
+    cfg = ccxt_config('bitmart', default_type='spot')
+    # No server-time sync: it calls /system/time, and public spot data does not
+    # need a synced clock.
+    cfg['options']['adjustForTimeDifference'] = False
+    ex = ccxt.bitmart(cfg)
+    if 'BitMart' in PROXY_EXCHANGES:
+        route_through_proxy(ex)
+    # ccxt's load_markets() also calls fetch_currencies(); a failure there would
+    # abort fetch_tickers() too. get_currencies() fetches them separately.
     ex.has['fetchCurrencies'] = False
+    # By default ccxt loads spot AND swap markets. Swap markets live on a
+    # different host (api-cloud-v2.bitmart.com), which failed DNS resolution
+    # here, and a spot scanner does not need them.
+    spot_markets = getattr(ex, 'fetch_spot_markets', None)
+    if callable(spot_markets):
+        ex.fetch_markets = spot_markets
+    else:
+        log.warning("  WARNING  BitMart: this ccxt build has no fetch_spot_markets(); "
+                    "swap markets (api-cloud-v2.bitmart.com) will be loaded too")
     return ex
 
 EXCHANGE_BUILDERS = {
@@ -341,16 +361,16 @@ def init_exchanges():
     for name in EXCHANGE_BUILDERS:
         ensure_exchange(name)
 
-COINEX_SPOT_TICKER_URL = "https://api.coinex.com/v2/spot/ticker"
+COINEX_TICKER_BATCH = 10   # API maximum markets per /spot/ticker request
 
 def fetch_coinex_spot_tickers(ex):
-    """Spot tickers for CoinEx, bypassing ccxt's fetch_tickers().
+    """Spot tickers for CoinEx, requested by explicit market list.
 
-    With no symbols, ccxt's CoinEx adapter returned 244 tickers that look like
-    the futures set ('FTTUSDT_INDEX' etc.) even with type/defaultType='spot', and
-    none of them end in '/USDT'. Here we hit the v2 spot ticker endpoint directly
-    and map market ids to symbols using spot markets only, so a spot/swap id
-    clash can never pick the wrong market.
+    Calling /v2/spot/ticker with no `market` returns 244 rows named like
+    'FTTUSDT_INDEX' on this setup (both through ccxt and when called directly),
+    not the spot tickers. Asking for explicit markets (max 10 per request, per
+    the CoinEx docs) returns normal rows, so we batch over the spot USDT
+    markets taken from load_markets().
     """
     if not ex.markets:
         ex.load_markets()
@@ -359,19 +379,33 @@ def fetch_coinex_spot_tickers(ex):
         for m in ex.markets.values()
         if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False
     }
-    fn = getattr(ex, 'v2PublicGetSpotTicker', None)
-    if fn is not None:
-        response = fn({})
-    else:
-        resp = requests.get(COINEX_SPOT_TICKER_URL, timeout=20)
-        resp.raise_for_status()
-        response = resp.json()
-    rows = response.get('data') if isinstance(response, dict) else None
-    if not isinstance(rows, list):
-        raise RuntimeError(f"CoinEx spot ticker: unexpected response {str(response)[:300]}")
+    ids = list(spot_by_id)
+    batches = [ids[i:i + COINEX_TICKER_BATCH] for i in range(0, len(ids), COINEX_TICKER_BATCH)]
+
+    def fetch_batch(batch):
+        response = with_retries(
+            lambda: ex.v2PublicGetSpotTicker({'market': ','.join(batch)}), 'CoinEx'
+        )
+        rows = response.get('data') if isinstance(response, dict) else None
+        if not isinstance(rows, list):
+            raise RuntimeError(f"unexpected response {str(response)[:300]}")
+        return rows
+
+    rows_all, failed, last_err = [], 0, None
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for fut in as_completed([pool.submit(fetch_batch, b) for b in batches]):
+            try:
+                rows_all.extend(fut.result())
+            except Exception as e:
+                failed += 1
+                last_err = e
+    if batches and failed == len(batches):
+        raise RuntimeError(f"all {failed} CoinEx ticker batches failed, last: {describe_error(last_err)}")
+    if failed:
+        log.warning(f"  WARNING  CoinEx: {failed}/{len(batches)} ticker batches failed, last: {describe_error(last_err)[:300]}")
 
     out = {}
-    for row in rows:
+    for row in rows_all:
         symbol = spot_by_id.get(row.get('market'))
         if not symbol:
             continue
@@ -395,10 +429,9 @@ def fetch_coinex_spot_tickers(ex):
         }
     if not out:
         log.warning(
-            f"  WARNING  CoinEx: spot ticker returned {len(rows)} rows, none matched "
+            f"  WARNING  CoinEx: {len(rows_all)} rows from {len(batches)} batches, none matched "
             f"{len(spot_by_id)} spot USDT markets  |  "
-            f"row ids: {[r.get('market') for r in rows[:5]]}  |  "
-            f"market ids: {list(spot_by_id)[:5]}"
+            f"first row: {str(rows_all[0])[:300] if rows_all else None}"
         )
     return out
 
