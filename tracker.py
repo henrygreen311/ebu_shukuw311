@@ -159,6 +159,23 @@ CREDENTIALS = load_api_credentials()
 
 TIMEOUT_MS = 10_000
 
+# Exchanges whose public endpoints are slow / heavy get a longer timeout.
+# BitMart's /account/v1/currencies payload is large and was failing at 10s.
+TIMEOUT_OVERRIDES_MS = {
+    'bitmart': 30_000,
+    'coinex':  20_000,
+}
+
+def describe_error(e):
+    """ccxt network errors carry only '<id> <METHOD> <url>' as their message
+    (no hint whether it was a timeout, a reset or an SSL failure). The real
+    reason lives in __cause__, so surface the exception type + cause too."""
+    text = f"{type(e).__name__}: {e}"
+    cause = getattr(e, '__cause__', None)
+    if cause is not None:
+        text += f"  |  cause: {type(cause).__name__}: {str(cause)[:200]}"
+    return text
+
 def ccxt_config(exchange_id_lower, default_type=None):
     """
     Build a ccxt config dict for the given exchange id.
@@ -171,7 +188,9 @@ def ccxt_config(exchange_id_lower, default_type=None):
     proxied = exchange_id_lower in PROXY_EXCHANGE_IDS
     cfg = {
         'enableRateLimit': True,
-        'timeout': 20_000 if proxied else TIMEOUT_MS,
+        'timeout': TIMEOUT_OVERRIDES_MS.get(
+            exchange_id_lower, 20_000 if proxied else TIMEOUT_MS
+        ),
         'options': {
             'adjustForTimeDifference': True,
         },
@@ -255,6 +274,15 @@ def _build_kucoin():
     ex.set_markets(ex.fetch_markets())
     return ex
 
+def _build_bitmart():
+    ex = ccxt.bitmart(ccxt_config('bitmart'))
+    # ccxt's load_markets() also calls fetch_currencies() (/account/v1/currencies)
+    # and any failure there aborts fetch_tickers() too. Tickers/markets don't need
+    # it, and get_currencies() fetches currencies separately with its own
+    # error handling and cache, so keep it out of the market-loading path.
+    ex.has['fetchCurrencies'] = False
+    return ex
+
 EXCHANGE_BUILDERS = {
     'Bybit':   lambda: route_through_proxy(ccxt.bybit(ccxt_config('bybit'))),
     'Bitget':  lambda: ccxt.bitget(ccxt_config('bitget')),
@@ -264,7 +292,7 @@ EXCHANGE_BUILDERS = {
     # CoinEx needs defaultType='spot' — otherwise its ccxt adapter returns
     # _INDEX / derivative markets and every symbol gets filtered out.
     'CoinEx':  lambda: ccxt.coinex(ccxt_config('coinex', default_type='spot')),
-    'BitMart': lambda: ccxt.bitmart(ccxt_config('bitmart')),
+    'BitMart': _build_bitmart,
     'OKX':     lambda: ccxt.okx(ccxt_config('okx')),
     'LBank':   lambda: ccxt.lbank(ccxt_config('lbank')),
 }
@@ -274,8 +302,13 @@ EXCHANGE_BUILDERS = {
 # the derivative markets it would otherwise return.
 EXTRA_PARAMS = {
     'Bybit':  {'category': 'spot'},
-    'CoinEx': {'type': 'spot'},
+    # CoinEx intentionally absent: tickers go through fetch_coinex_spot_tickers()
+    # and order books are addressed by a spot symbol, so no `type` is needed.
 }
+
+# Markets loaded eagerly at startup so failures are reported once and clearly
+# instead of surfacing inside the first fetch_tickers() call.
+EAGER_MARKET_EXCHANGES = PROXY_EXCHANGES | {'BitMart', 'CoinEx'}
 
 EXCHANGES = {}
 
@@ -293,13 +326,13 @@ def ensure_exchange(name):
         EXCHANGES[name] = None
         return None
 
-    if name in PROXY_EXCHANGES:
+    if name in EAGER_MARKET_EXCHANGES:
         try:
             ex.load_markets()
             if not ex.markets:
                 log.warning(f"  WARNING  {name}: load_markets() returned 0 markets (no exception raised)")
         except Exception as e:
-            log.warning(f"  WARNING  {name}: load_markets() failed — {str(e)[:400]}")
+            log.warning(f"  WARNING  {name}: load_markets() failed — {describe_error(e)[:600]}")
 
     EXCHANGES[name] = ex
     return ex
@@ -308,16 +341,81 @@ def init_exchanges():
     for name in EXCHANGE_BUILDERS:
         ensure_exchange(name)
 
+COINEX_SPOT_TICKER_URL = "https://api.coinex.com/v2/spot/ticker"
+
+def fetch_coinex_spot_tickers(ex):
+    """Spot tickers for CoinEx, bypassing ccxt's fetch_tickers().
+
+    With no symbols, ccxt's CoinEx adapter returned 244 tickers that look like
+    the futures set ('FTTUSDT_INDEX' etc.) even with type/defaultType='spot', and
+    none of them end in '/USDT'. Here we hit the v2 spot ticker endpoint directly
+    and map market ids to symbols using spot markets only, so a spot/swap id
+    clash can never pick the wrong market.
+    """
+    if not ex.markets:
+        ex.load_markets()
+    spot_by_id = {
+        m['id']: m['symbol']
+        for m in ex.markets.values()
+        if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False
+    }
+    fn = getattr(ex, 'v2PublicGetSpotTicker', None)
+    if fn is not None:
+        response = fn({})
+    else:
+        resp = requests.get(COINEX_SPOT_TICKER_URL, timeout=20)
+        resp.raise_for_status()
+        response = resp.json()
+    rows = response.get('data') if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"CoinEx spot ticker: unexpected response {str(response)[:300]}")
+
+    out = {}
+    for row in rows:
+        symbol = spot_by_id.get(row.get('market'))
+        if not symbol:
+            continue
+        last = _to_float(row.get('last'))
+        if not last or last <= 0:
+            continue
+        open_ = _to_float(row.get('open'))
+        quote_vol = _to_float(row.get('value'))
+        if quote_vol is None:
+            base_vol = _to_float(row.get('volume'))
+            quote_vol = base_vol * last if base_vol is not None else None
+        out[symbol] = {
+            'symbol':      symbol,
+            'last':        last,
+            'bid':         None,   # endpoint has no best bid/ask; build_price_map falls back
+            'ask':         None,   # to last, and the depth check uses the real order book
+            'high':        _to_float(row.get('high')),
+            'low':         _to_float(row.get('low')),
+            'quoteVolume': quote_vol,
+            'percentage':  ((last - open_) / open_ * 100) if open_ else None,
+        }
+    if not out:
+        log.warning(
+            f"  WARNING  CoinEx: spot ticker returned {len(rows)} rows, none matched "
+            f"{len(spot_by_id)} spot USDT markets  |  "
+            f"row ids: {[r.get('market') for r in rows[:5]]}  |  "
+            f"market ids: {list(spot_by_id)[:5]}"
+        )
+    return out
+
 def get_usdt_tickers(name):
     ex = ensure_exchange(name)
     if ex is None:
         return {}
     params = EXTRA_PARAMS.get(name, {})
     try:
-        tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
+        if name == 'CoinEx':
+            tickers = with_retries(lambda: fetch_coinex_spot_tickers(ex), name)
+        else:
+            tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
     except Exception as e:
-        # Wider truncation so exchange error bodies (BitMart/OKX) show up.
-        log.warning(f"  WARNING  {name}: {str(e)[:800]}")
+        # describe_error adds the exception type and underlying cause, since
+        # ccxt network errors otherwise read like 'bitmart GET <url>' only.
+        log.warning(f"  WARNING  {name}: {describe_error(e)[:800]}")
         EXCHANGES[name] = None
         return {}
     markets = getattr(ex, 'markets', None) or {}
@@ -569,18 +667,19 @@ def _sanitize_currencies(data):
 
 CURRENCY_CACHE = {}
 CURRENCY_CACHE_TTL = 1800
+CURRENCY_FAIL_TTL  = 120   # a failed fetch is retried soon, not locked out for 30 min
 CURRENCY_LOCKS = defaultdict(threading.Lock)
 
 def get_currencies(exchange_name):
     now = time.time()
     cached = CURRENCY_CACHE.get(exchange_name)
-    if cached and (now - cached['ts']) < CURRENCY_CACHE_TTL:
+    if cached and (now - cached['ts']) < cached.get('ttl', CURRENCY_CACHE_TTL):
         return cached['data']
 
     with CURRENCY_LOCKS[exchange_name]:
         cached = CURRENCY_CACHE.get(exchange_name)
         now = time.time()
-        if cached and (now - cached['ts']) < CURRENCY_CACHE_TTL:
+        if cached and (now - cached['ts']) < cached.get('ttl', CURRENCY_CACHE_TTL):
             return cached['data']
 
         ex = ensure_exchange(exchange_name)
@@ -590,11 +689,16 @@ def get_currencies(exchange_name):
             data = ex.fetch_currencies() or {}
             data = _sanitize_currencies(data)
         except Exception as e:
-            log.warning(f"  WARNING  {exchange_name} currencies: {str(e)[:300]}")
+            log.warning(f"  WARNING  {exchange_name} currencies: {describe_error(e)[:500]}")
             data = {}
+        fetched_ok = bool(data)
         if not data and cached:
             data = cached['data']
-        CURRENCY_CACHE[exchange_name] = {'ts': now, 'data': data}
+        CURRENCY_CACHE[exchange_name] = {
+            'ts': now,
+            'ttl': CURRENCY_CACHE_TTL if fetched_ok else CURRENCY_FAIL_TTL,
+            'data': data,
+        }
         if data:
             sample_code = next(iter(data))
             sample = data[sample_code]
@@ -1565,7 +1669,7 @@ def scan_once(scan_num):
             try:
                 tickers = future.result()
             except Exception as e:
-                log.warning(f"  WARNING  {name}: {str(e)[:800]}")
+                log.warning(f"  WARNING  {name}: {describe_error(e)[:800]}")
                 tickers = {}
             all_tickers[name] = tickers
             counts[name]      = len(tickers)
