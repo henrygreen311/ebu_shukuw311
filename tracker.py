@@ -38,7 +38,12 @@ CAPITAL_USD = 100
 DEPTH_CHECK_USD = 100
 MIN_STORE_PROFIT_USD = 0.1
 
+DEFAULT_MAKER_FEE = 0.001
 DEFAULT_TAKER_FEE = 0.001
+BUY_ORDER_TYPE = "taker"
+SELL_ORDER_TYPE = "taker"
+FEE_CACHE_TTL_SEC = 60 * 60
+MAX_PLAUSIBLE_FEE = 0.05
 LOG_CONFIRMED_ONLY = True
 
 ORDER_BOOK_LIMIT = 50
@@ -793,14 +798,14 @@ def _route_profit(route, symbol):
     else:
         buy_ex_for_fee, sell_ex_for_fee = route["buy_ex"], route["alt_ex"]
         buy_price, sell_price = route["buy_price_ref"], route["alt_price"]
-    buy_rate = get_trading_fee_rate(buy_ex_for_fee, symbol)
-    sell_rate = get_trading_fee_rate(sell_ex_for_fee, symbol)
+    buy_fees = get_trading_fees(buy_ex_for_fee, symbol)
+    sell_fees = get_trading_fees(sell_ex_for_fee, symbol)
     return calc_arb_profit(
         CAPITAL_USD, buy_price, sell_price,
         fee_tokens=route.get("fee"),
         min_withdrawal_tokens=route.get("min_withdrawal"),
-        buy_taker_rate=buy_rate,
-        sell_taker_rate=sell_rate,
+        buy_fees=buy_fees,
+        sell_fees=sell_fees,
     )
 
 
@@ -1361,19 +1366,92 @@ def apply_metadata_checks(results):
     return results
 
 
-def get_trading_fee_rate(exchange_name, symbol):
+_FEE_CACHE = {}
+_FEE_CACHE_LOCK = threading.Lock()
+
+FEE_SRC_LABEL = {
+    "account": "account",
+    "market": "market",
+    "exchange default": "exchange default",
+    "fallback": "⚠️ fallback",
+}
+
+
+def _valid_fee(val):
+    v = _to_float(val)
+    if v is None or v != v:
+        return None
+    if v < -MAX_PLAUSIBLE_FEE or v > MAX_PLAUSIBLE_FEE:
+        return None
+    return v
+
+
+def _fallback_fee_set(exchange_name=None):
+    return {
+        "exchange": exchange_name,
+        "maker": DEFAULT_MAKER_FEE,
+        "taker": DEFAULT_TAKER_FEE,
+        "maker_src": "fallback",
+        "taker_src": "fallback",
+    }
+
+
+def _resolve_trading_fees(exchange_name, symbol):
+    out = {
+        "exchange": exchange_name,
+        "maker": None, "taker": None,
+        "maker_src": None, "taker_src": None,
+    }
+
+    def _fill(source, data):
+        if not isinstance(data, dict):
+            return
+        for kind in ("maker", "taker"):
+            if out[kind] is None:
+                v = _valid_fee(data.get(kind))
+                if v is not None:
+                    out[kind] = v
+                    out[kind + "_src"] = source
+
     ex = ensure_exchange(exchange_name)
-    if ex is None:
-        return DEFAULT_TAKER_FEE
-    market = (getattr(ex, "markets", None) or {}).get(symbol)
-    if market and market.get("taker") is not None:
-        return market["taker"]
-    fees = getattr(ex, "fees", {}) or {}
-    trading = fees.get("trading") or {}
-    taker = trading.get("taker")
-    if taker is not None:
-        return taker
-    return DEFAULT_TAKER_FEE
+    if ex is not None:
+        if getattr(ex, "apiKey", None) and (getattr(ex, "has", {}) or {}).get("fetchTradingFee"):
+            try:
+                _fill("account", ex.fetch_trading_fee(symbol))
+            except Exception as e:
+                log.warning(
+                    f"  WARNING  {exchange_name} fetch_trading_fee({symbol}): {str(e)[:200]}"
+                )
+
+        if out["maker"] is None or out["taker"] is None:
+            try:
+                if not ex.markets:
+                    ex.load_markets()
+            except Exception as e:
+                log.warning(f"  WARNING  {exchange_name} load_markets for fees: {str(e)[:200]}")
+            _fill("market", (getattr(ex, "markets", None) or {}).get(symbol))
+
+        if out["maker"] is None or out["taker"] is None:
+            _fill("exchange default", (getattr(ex, "fees", {}) or {}).get("trading"))
+
+    for kind, default in (("maker", DEFAULT_MAKER_FEE), ("taker", DEFAULT_TAKER_FEE)):
+        if out[kind] is None:
+            out[kind] = default
+            out[kind + "_src"] = "fallback"
+    return out
+
+
+def get_trading_fees(exchange_name, symbol):
+    key = (exchange_name, symbol)
+    now = time.time()
+    with _FEE_CACHE_LOCK:
+        hit = _FEE_CACHE.get(key)
+        if hit and now - hit[0] < FEE_CACHE_TTL_SEC:
+            return hit[1]
+    fees = _resolve_trading_fees(exchange_name, symbol)
+    with _FEE_CACHE_LOCK:
+        _FEE_CACHE[key] = (now, fees)
+    return fees
 
 
 def _is_confirmed_tradable(r):
@@ -1404,17 +1482,19 @@ def fmt_vol(v):
 
 def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
                     min_withdrawal_tokens=None,
-                    buy_taker_rate=0.0, sell_taker_rate=0.0):
+                    buy_fees=None, sell_fees=None):
     if not buy_price or buy_price <= 0 or not sell_price or sell_price <= 0:
         return None
 
-    buy_taker_rate = buy_taker_rate or 0.0
-    sell_taker_rate = sell_taker_rate or 0.0
+    buy_fees = buy_fees or _fallback_fee_set()
+    sell_fees = sell_fees or _fallback_fee_set()
+    buy_fee_rate = buy_fees[BUY_ORDER_TYPE]
+    sell_fee_rate = sell_fees[SELL_ORDER_TYPE]
     fee_tokens = _to_float(fee_tokens)
     min_withdrawal_tokens = _to_float(min_withdrawal_tokens)
 
     tokens_bought = capital_usd / buy_price
-    buy_fee_usd = capital_usd * buy_taker_rate
+    buy_fee_usd = capital_usd * buy_fee_rate
 
     min_withdrawal_met = (
         tokens_bought >= min_withdrawal_tokens
@@ -1426,24 +1506,28 @@ def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
     tokens_remaining = tokens_bought - gas_tokens
 
     gross_sell_usd = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
-    sell_fee_usd = gross_sell_usd * sell_taker_rate
+    sell_fee_usd = gross_sell_usd * sell_fee_rate
     total_received = gross_sell_usd - sell_fee_usd
 
-    total_cost = capital_usd
+    total_cost = capital_usd + buy_fee_usd
     net_pnl = total_received - total_cost
     roi_pct = (net_pnl / capital_usd) * 100 if capital_usd else 0.0
 
     return {
         "capital": capital_usd,
         "tokens_bought": tokens_bought,
+        "buy_fees": buy_fees,
+        "buy_fee_type": BUY_ORDER_TYPE,
+        "buy_fee_rate": buy_fee_rate,
         "buy_fee_usd": buy_fee_usd,
-        "buy_taker_rate": buy_taker_rate,
         "min_withdrawal_tokens": min_withdrawal_tokens,
         "min_withdrawal_met": min_withdrawal_met,
         "gas_tokens": gas_tokens,
         "tokens_remaining": tokens_remaining,
+        "sell_fees": sell_fees,
+        "sell_fee_type": SELL_ORDER_TYPE,
+        "sell_fee_rate": sell_fee_rate,
         "sell_fee_usd": sell_fee_usd,
-        "sell_taker_rate": sell_taker_rate,
         "total_cost": total_cost,
         "total_received": total_received,
         "net_pnl": net_pnl,
@@ -1455,9 +1539,18 @@ def log_profit_block(profit):
     if not profit:
         return
     log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
+    for fees in (profit["buy_fees"], profit["sell_fees"]):
+        log.info(
+            f"       PROFIT Fee rates {fees['exchange']}: "
+            f"maker {fees['maker'] * 100:.4f}% [{FEE_SRC_LABEL[fees['maker_src']]}]  |  "
+            f"taker {fees['taker'] * 100:.4f}% [{FEE_SRC_LABEL[fees['taker_src']]}]"
+        )
     log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
-    if profit["buy_taker_rate"]:
-        log.info(f"       PROFIT Buy trading fee=  -{profit['buy_fee_usd']:.4f}")
+    log.info(
+        f"       PROFIT Buy {profit['buy_fee_type']} fee "
+        f"({profit['buy_fee_rate'] * 100:.4f}% @ {profit['buy_fees']['exchange']})= "
+        f" {-profit['buy_fee_usd']:+.4f}"
+    )
     if profit["min_withdrawal_tokens"] is not None:
         mark = "✅" if profit["min_withdrawal_met"] else "❌"
         note = (
@@ -1471,8 +1564,11 @@ def log_profit_block(profit):
         )
     log.info(f"       PROFIT Gas deducted= -{profit['gas_tokens']:.6f}")
     log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
-    if profit["sell_taker_rate"]:
-        log.info(f"       PROFIT Sell trading fee=  -{profit['sell_fee_usd']:.4f}")
+    log.info(
+        f"       PROFIT Sell {profit['sell_fee_type']} fee "
+        f"({profit['sell_fee_rate'] * 100:.4f}% @ {profit['sell_fees']['exchange']})= "
+        f" {-profit['sell_fee_usd']:+.4f}"
+    )
     log.info(f"       PROFIT Total cost= {profit['total_cost']:.4f} USDT")
     log.info(f"       PROFIT Total received= {profit['total_received']:.4f} USDT")
     log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
@@ -1626,14 +1722,14 @@ def print_results(results, scan_num, duration, counts):
                     f"network {r['withdrawal_network']}  fee {r['withdrawal_fee']}  "
                     f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
                 )
-                buy_fee_rate = get_trading_fee_rate(r["buy_ex"], r["symbol"])
-                sell_fee_rate = get_trading_fee_rate(r["sell_ex"], r["symbol"])
+                buy_fees = get_trading_fees(r["buy_ex"], r["symbol"])
+                sell_fees = get_trading_fees(r["sell_ex"], r["symbol"])
                 profit = calc_arb_profit(
                     CAPITAL_USD, r["buy_price"], r["sell_price"],
                     fee_tokens=r["withdrawal_fee"],
                     min_withdrawal_tokens=r["withdrawal_min_tokens"],
-                    buy_taker_rate=buy_fee_rate,
-                    sell_taker_rate=sell_fee_rate,
+                    buy_fees=buy_fees,
+                    sell_fees=sell_fees,
                 )
                 log_profit_block(profit)
                 real_gap = r["depth_gap_pct"] if r["depth_gap_pct"] is not None else r["gap_pct"]
@@ -1656,14 +1752,14 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['alt_ex']} → {ar['sell_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_fee_rate = get_trading_fee_rate(ar["alt_ex"], r["symbol"])
-                    sell_fee_rate = get_trading_fee_rate(r["sell_ex"], r["symbol"])
+                    buy_fees = get_trading_fees(ar["alt_ex"], r["symbol"])
+                    sell_fees = get_trading_fees(r["sell_ex"], r["symbol"])
                     profit = calc_arb_profit(
                         CAPITAL_USD, ar["alt_price"], r["sell_price"],
                         fee_tokens=ar.get("fee"),
                         min_withdrawal_tokens=ar.get("min_withdrawal"),
-                        buy_taker_rate=buy_fee_rate,
-                        sell_taker_rate=sell_fee_rate,
+                        buy_fees=buy_fees,
+                        sell_fees=sell_fees,
                     )
                     log_profit_block(profit)
                     maybe_store_arb_coin(
@@ -1680,14 +1776,14 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['buy_ex']} → {ar['alt_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_fee_rate = get_trading_fee_rate(r["buy_ex"], r["symbol"])
-                    sell_fee_rate = get_trading_fee_rate(ar["alt_ex"], r["symbol"])
+                    buy_fees = get_trading_fees(r["buy_ex"], r["symbol"])
+                    sell_fees = get_trading_fees(ar["alt_ex"], r["symbol"])
                     profit = calc_arb_profit(
                         CAPITAL_USD, r["buy_price"], ar["alt_price"],
                         fee_tokens=ar.get("fee"),
                         min_withdrawal_tokens=ar.get("min_withdrawal"),
-                        buy_taker_rate=buy_fee_rate,
-                        sell_taker_rate=sell_fee_rate,
+                        buy_fees=buy_fees,
+                        sell_fees=sell_fees,
                     )
                     log_profit_block(profit)
                     maybe_store_arb_coin(
@@ -1758,14 +1854,14 @@ def print_results(results, scan_num, duration, counts):
                             f"       VERIFY  ✅ Tradable via {cp['buy_ex']} → {cp['sell_ex']} | "
                             f"network {cp['tradable_network']} 🚀"
                         )
-                        buy_fee_rate = get_trading_fee_rate(cp["buy_ex"], r["symbol"])
-                        sell_fee_rate = get_trading_fee_rate(cp["sell_ex"], r["symbol"])
+                        buy_fees = get_trading_fees(cp["buy_ex"], r["symbol"])
+                        sell_fees = get_trading_fees(cp["sell_ex"], r["symbol"])
                         profit = calc_arb_profit(
                             CAPITAL_USD, cp["buy_price"], cp["sell_price"],
                             fee_tokens=cp.get("fee"),
                             min_withdrawal_tokens=cp.get("min_withdrawal"),
-                            buy_taker_rate=buy_fee_rate,
-                            sell_taker_rate=sell_fee_rate,
+                            buy_fees=buy_fees,
+                            sell_fees=sell_fees,
                         )
                         log_profit_block(profit)
                         maybe_store_arb_coin(
@@ -1834,7 +1930,9 @@ def main():
     log.info(f"Price cap : {MAX_PRICE_RATIO}x ratio between exchanges")
     log.info(f"Capital   : ${CAPITAL_USD} per trade (profit calc)")
     log.info(
-        f"Taker fee : {DEFAULT_TAKER_FEE*100:.2f}% fallback (live rates fetched from exchange)"
+        f"Fees      : maker/taker confirmed per token per exchange  |  buy={BUY_ORDER_TYPE} "
+        f"sell={SELL_ORDER_TYPE}  |  fallback maker {DEFAULT_MAKER_FEE*100:.2f}% / "
+        f"taker {DEFAULT_TAKER_FEE*100:.2f}%"
     )
     log.info(
         "Log mode  : "
