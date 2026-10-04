@@ -332,6 +332,21 @@ EAGER_MARKET_EXCHANGES = PROXY_EXCHANGES | {'BitMart', 'CoinEx'}
 
 EXCHANGES = {}
 
+UNREACHABLE_UNTIL = {}        # name -> epoch seconds; exchange skipped until then
+UNREACHABLE_COOLDOWN = 600
+
+def is_dns_error(e):
+    text = describe_error(e)
+    return any(k in text for k in (
+        'NameResolutionError', 'Name or service not known',
+        'getaddrinfo failed', 'Temporary failure in name resolution',
+    ))
+
+def mark_unreachable(name, e):
+    UNREACHABLE_UNTIL[name] = time.time() + UNREACHABLE_COOLDOWN
+    log.warning(f"  WARNING  {name}: DNS cannot resolve the exchange host from this machine; "
+                f"skipping it for {UNREACHABLE_COOLDOWN // 60} min (fix DNS/VPN or use the relay)")
+
 def ensure_exchange(name):
     if EXCHANGES.get(name) is not None:
         return EXCHANGES[name]
@@ -353,6 +368,8 @@ def ensure_exchange(name):
                 log.warning(f"  WARNING  {name}: load_markets() returned 0 markets (no exception raised)")
         except Exception as e:
             log.warning(f"  WARNING  {name}: load_markets() failed — {describe_error(e)[:600]}")
+            if is_dns_error(e):
+                mark_unreachable(name, e)
 
     EXCHANGES[name] = ex
     return ex
@@ -361,56 +378,70 @@ def init_exchanges():
     for name in EXCHANGE_BUILDERS:
         ensure_exchange(name)
 
-COINEX_TICKER_BATCH = 10   # API maximum markets per /spot/ticker request
+COINEX_TICKER_BATCH = 10      # API maximum markets per /spot/ticker request
+COINEX_MIN_TICKERS  = 20      # below this the v2 result is treated as unusable
+COINEX_DEAD_IDS = set()       # spot ids the ticker endpoint rejects (remembered across scans)
+COINEX_STATE = {'use_v1': False}
 
-def fetch_coinex_spot_tickers(ex):
-    """Spot tickers for CoinEx, requested by explicit market list.
-
-    Calling /v2/spot/ticker with no `market` returns 244 rows named like
-    'FTTUSDT_INDEX' on this setup (both through ccxt and when called directly),
-    not the spot tickers. Asking for explicit markets (max 10 per request, per
-    the CoinEx docs) returns normal rows, so we batch over the spot USDT
-    markets taken from load_markets().
-    """
-    if not ex.markets:
-        ex.load_markets()
-    spot_by_id = {
-        m['id']: m['symbol']
-        for m in ex.markets.values()
-        if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False
-    }
-    ids = list(spot_by_id)
-    batches = [ids[i:i + COINEX_TICKER_BATCH] for i in range(0, len(ids), COINEX_TICKER_BATCH)]
-
-    def fetch_batch(batch):
-        response = with_retries(
-            lambda: ex.v2PublicGetSpotTicker({'market': ','.join(batch)}), 'CoinEx'
-        )
+def _coinex_v2_rows(ex, ids):
+    """Rows for `ids` from /v2/spot/ticker. The endpoint rejects the whole request
+    if any single market is unknown ('market GNOUSDT not found'), so on that error
+    the batch is bisected until the bad ids are isolated and remembered."""
+    if not ids:
+        return []
+    try:
+        response = None
+        for attempt in range(3):
+            try:
+                response = ex.v2PublicGetSpotTicker({'market': ','.join(ids)})
+                break
+            except ccxt.NetworkError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.5)
         rows = response.get('data') if isinstance(response, dict) else None
         if not isinstance(rows, list):
             raise RuntimeError(f"unexpected response {str(response)[:300]}")
         return rows
+    except ccxt.NetworkError:
+        raise
+    except ccxt.ExchangeError as e:
+        msg = str(e)
+        if 'not found' not in msg and 'nvalid' not in msg:
+            raise
+        if len(ids) == 1:
+            COINEX_DEAD_IDS.add(ids[0])
+            return []
+        mid = len(ids) // 2
+        return _coinex_v2_rows(ex, ids[:mid]) + _coinex_v2_rows(ex, ids[mid:])
 
-    rows_all, failed, last_err = [], 0, None
+def _coinex_v2_spot(ex, spot_by_id):
+    ids = [i for i in spot_by_id if i not in COINEX_DEAD_IDS]
+    batches = [ids[i:i + COINEX_TICKER_BATCH] for i in range(0, len(ids), COINEX_TICKER_BATCH)]
+    probe, rest = batches[:3], batches[3:]
+
+    rows_all = []
+    for b in probe:                       # sequential probe: cheap way to notice a useless endpoint
+        rows_all.extend(_coinex_v2_rows(ex, b))
+    if probe and not rows_all:
+        raise RuntimeError("v2 /spot/ticker returned no rows for the first 30 spot markets")
+
+    failed, last_err = 0, None
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for fut in as_completed([pool.submit(fetch_batch, b) for b in batches]):
+        for fut in as_completed([pool.submit(_coinex_v2_rows, ex, b) for b in rest]):
             try:
                 rows_all.extend(fut.result())
             except Exception as e:
                 failed += 1
                 last_err = e
-    if batches and failed == len(batches):
-        raise RuntimeError(f"all {failed} CoinEx ticker batches failed, last: {describe_error(last_err)}")
     if failed:
-        log.warning(f"  WARNING  CoinEx: {failed}/{len(batches)} ticker batches failed, last: {describe_error(last_err)[:300]}")
+        log.warning(f"  WARNING  CoinEx: {failed}/{len(rest)} v2 ticker batches failed, last: {describe_error(last_err)[:300]}")
 
     out = {}
     for row in rows_all:
         symbol = spot_by_id.get(row.get('market'))
-        if not symbol:
-            continue
         last = _to_float(row.get('last'))
-        if not last or last <= 0:
+        if not symbol or not last or last <= 0:
             continue
         open_ = _to_float(row.get('open'))
         quote_vol = _to_float(row.get('value'))
@@ -418,26 +449,71 @@ def fetch_coinex_spot_tickers(ex):
             base_vol = _to_float(row.get('volume'))
             quote_vol = base_vol * last if base_vol is not None else None
         out[symbol] = {
-            'symbol':      symbol,
-            'last':        last,
-            'bid':         None,   # endpoint has no best bid/ask; build_price_map falls back
-            'ask':         None,   # to last, and the depth check uses the real order book
-            'high':        _to_float(row.get('high')),
-            'low':         _to_float(row.get('low')),
+            'symbol': symbol, 'last': last, 'bid': None, 'ask': None,
+            'high': _to_float(row.get('high')), 'low': _to_float(row.get('low')),
             'quoteVolume': quote_vol,
-            'percentage':  ((last - open_) / open_ * 100) if open_ else None,
+            'percentage': ((last - open_) / open_ * 100) if open_ else None,
         }
-    if not out:
-        log.warning(
-            f"  WARNING  CoinEx: {len(rows_all)} rows from {len(batches)} batches, none matched "
-            f"{len(spot_by_id)} spot USDT markets  |  "
-            f"first row: {str(rows_all[0])[:300] if rows_all else None}"
-        )
+    return out
+
+def _coinex_v1_spot(ex, spot_by_id):
+    """Legacy all-in-one endpoint (/v1/market/ticker/all); includes best bid/ask."""
+    response = ex.v1PublicGetMarketTickerAll({})
+    data = response.get('data') if isinstance(response, dict) else None
+    tick = data.get('ticker') if isinstance(data, dict) else None
+    if not isinstance(tick, dict):
+        raise RuntimeError(f"v1 ticker/all: unexpected response {str(response)[:300]}")
+    out = {}
+    for market_id, t in tick.items():
+        symbol = spot_by_id.get(market_id)
+        last = _to_float(t.get('last'))
+        if not symbol or not last or last <= 0:
+            continue
+        open_ = _to_float(t.get('open'))
+        base_vol = _to_float(t.get('vol'))
+        out[symbol] = {
+            'symbol': symbol, 'last': last,
+            'bid': _to_float(t.get('buy')), 'ask': _to_float(t.get('sell')),
+            'high': _to_float(t.get('high')), 'low': _to_float(t.get('low')),
+            'quoteVolume': base_vol * last if base_vol is not None else None,
+            'percentage': ((last - open_) / open_ * 100) if open_ else None,
+        }
+    return out
+
+def fetch_coinex_spot_tickers(ex):
+    """Spot tickers for CoinEx without ccxt's fetch_tickers().
+
+    /v2/spot/ticker with no `market` returns 244 'FTTUSDT_INDEX'-style rows here,
+    so tickers are requested by explicit market list instead (v2), and the legacy
+    v1 all-tickers endpoint is the fallback if v2 yields too little."""
+    if not ex.markets:
+        ex.load_markets()
+    spot_by_id = {
+        m['id']: m['symbol']
+        for m in ex.markets.values()
+        if m.get('spot') and m.get('quote') == 'USDT' and m.get('active') is not False
+    }
+    out, v2_err = {}, None
+    if not COINEX_STATE['use_v1']:
+        try:
+            out = _coinex_v2_spot(ex, spot_by_id)
+        except Exception as e:
+            v2_err = e
+    if len(out) < COINEX_MIN_TICKERS:
+        why = describe_error(v2_err)[:250] if v2_err else f"v2 gave {len(out)} usable tickers ({len(COINEX_DEAD_IDS)} ids rejected)"
+        if not COINEX_STATE['use_v1']:
+            log.warning(f"  WARNING  CoinEx: falling back to v1 ticker/all — {why}")
+        out_v1 = _coinex_v1_spot(ex, spot_by_id)      # raises if v1 is gone too
+        if len(out_v1) > len(out):
+            out = out_v1
+            COINEX_STATE['use_v1'] = True
     return out
 
 def get_usdt_tickers(name):
+    if time.time() < UNREACHABLE_UNTIL.get(name, 0):
+        return {}
     ex = ensure_exchange(name)
-    if ex is None:
+    if ex is None or time.time() < UNREACHABLE_UNTIL.get(name, 0):
         return {}
     params = EXTRA_PARAMS.get(name, {})
     try:
@@ -450,6 +526,8 @@ def get_usdt_tickers(name):
         # ccxt network errors otherwise read like 'bitmart GET <url>' only.
         log.warning(f"  WARNING  {name}: {describe_error(e)[:800]}")
         EXCHANGES[name] = None
+        if is_dns_error(e):
+            mark_unreachable(name, e)
         return {}
     markets = getattr(ex, 'markets', None) or {}
     result = {}
