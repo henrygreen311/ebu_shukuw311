@@ -1550,7 +1550,7 @@ def log_profit_block(profit, symbol=None):
             f"       PROFIT Min withdrawal= {profit['min_withdrawal_tokens']:.6f} tokens  [{mark} "
             f"{note}]"
         )
-    log.info(f"       PROFIT Gas deducted= -{profit['gas_tokens']:.6f}")
+    log.info(f"       PROFIT withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
     log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
     log.info(
         f"       PROFIT Sell taker fee ({profit['sell_fee_rate'] * 100:.4f}% "
