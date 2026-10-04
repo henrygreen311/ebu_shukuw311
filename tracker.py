@@ -1386,6 +1386,46 @@ def _cache_put(key, value):
         _FEE_CACHE[key] = (time.time(), value)
 
 
+def _find_key(obj, names):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in names and not isinstance(v, (dict, list)):
+                return v
+        for v in obj.values():
+            found = _find_key(v, names)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_key(v, names)
+            if found is not None:
+                return found
+    return None
+
+
+def _bingx_spot_taker_fee(ex, symbol):
+    # ccxt's BingX fetchTradingFee reads the futures commission endpoint and returns no rate for
+    # spot pairs, so call the spot endpoint (/openApi/spot/v1/user/commissionRate) directly.
+    if not ex.markets:
+        ex.load_markets()
+    market = ex.market(symbol)
+    if not market.get("spot"):
+        raise ValueError(f"{symbol} is not a spot market")
+    method = (
+        getattr(ex, "spotV1PrivateGetUserCommissionRate", None)
+        or getattr(ex, "spot_v1_private_get_user_commission_rate", None)
+    )
+    if method is None:
+        raise ValueError("this ccxt version has no spot commissionRate endpoint for BingX")
+    response = method({"symbol": market["id"]})
+    return _find_key(response, ("takerCommissionRate", "taker"))
+
+
+EXCHANGE_FEE_FETCHERS = {
+    "BingX": _bingx_spot_taker_fee,
+}
+
+
 def _fetch_pair_taker_fee(exchange_name, symbol):
     ex = ensure_exchange(exchange_name)
     if ex is None:
@@ -1395,6 +1435,16 @@ def _fetch_pair_taker_fee(exchange_name, symbol):
 
     has = getattr(ex, "has", {}) or {}
     errors = []
+
+    custom_fetcher = EXCHANGE_FEE_FETCHERS.get(exchange_name)
+    if custom_fetcher:
+        try:
+            fee = _valid_fee(custom_fetcher(ex, symbol))
+            if fee is not None:
+                return fee, None
+            errors.append(f"{exchange_name} spot fee endpoint returned no taker rate")
+        except Exception as e:
+            errors.append(f"{exchange_name} spot fee endpoint: {str(e)[:150]}")
 
     if has.get("fetchTradingFee"):
         try:
