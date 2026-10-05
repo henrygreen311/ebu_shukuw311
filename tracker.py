@@ -34,8 +34,8 @@ ALT_ROUTE_MIN_GAP_PERCENT = MIN_GAP_PERCENT
 MAX_PRICE_RATIO = 3.0
 MIN_CONFIRMED_PAIR_GAP = 3.0
 
-CAPITAL_USDT = 10
-DEPTH_CHECK_USDT = 10
+CAPITAL_USDT = 100
+DEPTH_CHECK_USDT = 100
 MIN_STORE_PROFIT_USDT = 0.1
 
 FEE_CACHE_TTL_SEC = 60 * 60
@@ -252,6 +252,7 @@ EXCHANGE_BUILDERS = {
     "KuCoin": _build_kucoin,
     "OKX": lambda: ccxt.okx(ccxt_config("okx")),
     "LBank": lambda: ccxt.lbank(ccxt_config("lbank")),
+    "Gate": lambda: ccxt.gate(ccxt_config("gate")),
 }
 
 EXTRA_PARAMS = {
