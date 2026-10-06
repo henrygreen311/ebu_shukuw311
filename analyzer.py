@@ -53,7 +53,7 @@ FEE_CACHE_TTL_SEC = 60 * 60
 FEE_RETRY_AFTER_FAIL_SEC = 60
 
 
-MAX_TRANSFER_TIME_SEC = 5 * 60
+MAX_TRANSFER_TIME_SEC = 15 * 60
 
 
 NETWORK_BLOCK_TIME_SEC = {
@@ -479,18 +479,16 @@ _TIME_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Only explicit, human-readable arrival-time fields are trusted. Anything
+# involving confirmation counts is deliberately excluded — those multiply
+# against a block-time table that is wrong for many networks (especially
+# new chains like Robinhood, where the API reports thousands of "confirmations"
+# that don't translate to the user-visible arrival estimate at all).
 _TIME_KEYS = (
     'estimatedArrivalTime', 'estimated_arrival_time', 'arrivalTime', 'arrival_time',
-    'estimateArrivalTime', 'estimatedTime', 'estimated_time', 'confirmTime',
-    'confirm_time', 'depositTime', 'deposit_time', 'withdrawTime', 'withdraw_time',
-    'avgTime', 'avg_time', 'time',
-)
-
-_CONFIRM_KEYS = (
-    'confirmations', 'confirms', 'confirmation', 'minConfirm', 'min_confirm',
-    'requiredConfirmCount', 'confirmationCount', 'confirmNumber', 'unLockConfirm',
-    'depositConfirm', 'deposit_confirm', 'withdrawConfirm', 'withdraw_confirm',
-    'minConfirmCount',
+    'estimateArrivalTime', 'estimatedTime', 'estimated_time',
+    'depositTime', 'deposit_time', 'withdrawTime', 'withdraw_time',
+    'avgTime', 'avg_time',
 )
 
 
@@ -498,6 +496,7 @@ def _parse_time_text_to_seconds(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
+        # Numeric fields in this context are minutes, not seconds.
         return float(value) * 60 if value > 0 else None
     text = str(value).strip()
     if not text:
@@ -520,6 +519,12 @@ def _find_first_key(d, keys):
 
 
 def _extract_time_estimate(network_data, network_norm):
+    """
+    Returns (seconds, description) only when the exchange provides an
+    explicit arrival-time field. Never guesses from confirmation counts.
+    Returns (None, None) when nothing reliable is available — callers must
+    treat that as "unknown", not as "too slow".
+    """
     if not isinstance(network_data, dict):
         return None, None
     info = network_data.get('info')
@@ -533,21 +538,6 @@ def _extract_time_estimate(network_data, network_norm):
             seconds = _parse_time_text_to_seconds(val)
             if seconds is not None:
                 return seconds, f"{key}={val!r}"
-
-    for source in (network_data, info):
-        if not isinstance(source, dict):
-            continue
-        key, val = _find_first_key(source, _CONFIRM_KEYS)
-        if key is not None:
-            try:
-                confirms = float(val)
-            except (TypeError, ValueError):
-                continue
-            if confirms <= 0:
-                continue
-            block_time = NETWORK_BLOCK_TIME_SEC.get(network_norm, DEFAULT_BLOCK_TIME_SEC)
-            seconds = confirms * block_time
-            return seconds, f"{key}={val!r} (~{block_time}s/block on {network_norm or 'unknown'})"
 
     return None, None
 
@@ -1454,7 +1444,7 @@ def save_trade_coin(r, profit):
     coin_wd_network = r.get('withdrawal_network_norm')
 
     transfer_secs = r.get('transfer_seconds')
-    arrival_time = f"est. {_fmt_duration(transfer_secs)}" if transfer_secs is not None else None
+    arrival_time = f"est. {_fmt_duration(transfer_secs)}" if transfer_secs is not None else "est. <15min"
 
     usdt_holder  = profit.get('usdt_transfer_from')
     usdt_network = profit.get('usdt_transfer_network')
@@ -1885,14 +1875,19 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
 
 
 def _check_transfer_time(r):
+    """
+    Only reject when we have an EXPLICIT arrival estimate that exceeds the
+    limit. When the estimate is unknown (None), we accept the pair — the
+    exchange didn't tell us, so we can't claim it's slow.
+    """
     seconds = r.get('transfer_seconds')
-    if seconds is None or seconds <= MAX_TRANSFER_TIME_SEC:
+    if seconds is None:
+        return None
+    if seconds <= MAX_TRANSFER_TIME_SEC:
         return None
     return {
         'ok': False,
-        'reason': (
-            f"transfer too slow (~{_fmt_duration(seconds)})"
-        ),
+        'reason': f"transfer too slow ({_fmt_duration(seconds)})",
         'r': r, 'profit': None, 'delete': True,
     }
 
@@ -2092,6 +2087,8 @@ def print_pair_report_full(r, profit):
         log.info(f"       verify        ok  ({basis} match · {r['withdrawal_network']} · fee {r['withdrawal_fee']} · min {r['withdrawal_min_tokens']})")
         if r.get('transfer_seconds') is not None:
             log.info(f"       arrival       ~{_fmt_duration(r['transfer_seconds'])}")
+        else:
+            log.info(f"       arrival       unknown  (exchange returned no explicit time)")
         if profit and profit.get('usdt_transfer_from'):
             if profit.get('usdt_transfer_network') is None:
                 log.info(f"       usdt          already on {profit['usdt_transfer_from']}")
@@ -2299,6 +2296,7 @@ def main():
     log.info(f"  min profit        {MIN_STORE_PROFIT_USDT} USDT")
     log.info(f"  capital           {CAPITAL_USDT} USDT")
     log.info(f"  depth check       {DEPTH_CHECK_USDT} USDT")
+    log.info(f"  max transfer      {MAX_TRANSFER_TIME_SEC // 60}min")
     log.info(f"  fail limit        {FAIL_STREAK_LIMIT}")
     log.info(f"  scanner proxies   {', '.join(sorted(PROXY_EXCHANGES_SCAN))}")
     log.info(f"  trader proxies    {', '.join(sorted(PROXY_EXCHANGES_TRADE))}")
