@@ -1,25 +1,3 @@
-"""
-trader.py — arb analyzer (Stage 2)
-
-TRANSFER TIME POLICY
---------------------
-We trust the exchange's own "Expected Arrival" figure when it can be parsed
-from the currency/network metadata (examples from MEXC's UI/API:
-"0m 13s", "5m 4s", "1m 2s", "1m 14s", "4m 10s").  We never derive a
-transfer time from confirmation counts — that heuristic is what produced
-absurd estimates like "1500min" for networks whose real arrival is <1s.
-
-  * Time known, > MAX_TRANSFER_TIME_SEC        -> reject the pair
-  * Time known, <= MAX_TRANSFER_TIME_SEC       -> allow the pair
-  * Time unknown (one or both legs)            -> assume MAX_TRANSFER_TIME_SEC
-                                                 and allow the pair
-  * At least one leg known > MAX               -> reject the pair
-
-Rationale: an unknown time is not evidence of a slow time.  Capping the
-unknown at the ceiling (15 min) keeps the pair in the pipeline without
-pretending to know something the exchange never told us.
-"""
-
 import ccxt
 import re
 import time
@@ -32,14 +10,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
-
 PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"
-PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php"
+PROXY_BASE_TRADE = "https://arb-bot.infinityfree.io/trade_proxy.php"
 
-
-# Scan proxies match tracker.py (Bybit + KuCoin).
 PROXY_EXCHANGES_SCAN = {'Bybit', 'KuCoin'}
-# Trade proxies: the analyzer still uses the trade proxy for these.
 PROXY_EXCHANGES_TRADE = {
     'Bybit', 'Bitget', 'MEXC', 'BingX',
     'OKX', 'KuCoin',
@@ -47,9 +21,7 @@ PROXY_EXCHANGES_TRADE = {
 PROXY_EXCHANGE_IDS_SCAN = {name.lower() for name in PROXY_EXCHANGES_SCAN}
 PROXY_EXCHANGE_IDS_TRADE = {name.lower() for name in PROXY_EXCHANGES_TRADE}
 
-# Same hostname overrides as tracker.py (empty by default, kept for parity).
 EXCHANGE_HOSTNAME_OVERRIDES = {}
-
 
 _PROXY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -60,9 +32,7 @@ _PROXY_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
-
 _proxy_session = requests.Session()
-
 
 TIMEOUT_MS = 10_000
 PROXY_TIMEOUT_MS = 20_000
@@ -77,12 +47,7 @@ MIN_STORE_PROFIT_USDT = 1
 FEE_CACHE_TTL_SEC = 60 * 60
 FEE_RETRY_AFTER_FAIL_SEC = 60
 
-
-# Anything at or below this duration is accepted.  If the exchange does not
-# report a duration at all we assume this value (see TRANSFER TIME POLICY
-# in the module docstring) so that missing data never rejects a pair.
 MAX_TRANSFER_TIME_SEC = 15 * 60
-
 
 NETWORK_BLOCK_TIME_SEC = {
     'ETH': 12, 'BSC': 3, 'TRX': 3, 'MATIC': 2, 'ARB': 0.3, 'OP': 2,
@@ -116,7 +81,6 @@ log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-
 def with_retries(fn, label):
     last_err = None
     for attempt in range(RETRY_ATTEMPTS + 1):
@@ -127,7 +91,6 @@ def with_retries(fn, label):
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_DELAY)
     raise last_err
-
 
 def _load_db_config() -> dict:
     import os
@@ -150,12 +113,10 @@ def _load_db_config() -> dict:
             return config
     raise FileNotFoundError(f"db.txt not found in any of: {candidates}")
 
-
 def _get_supabase():
     from supabase import create_client
     config = _load_db_config()
     return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-
 
 _SUPABASE_CLIENT = None
 
@@ -164,7 +125,6 @@ def _get_supabase_cached():
     if _SUPABASE_CLIENT is None:
         _SUPABASE_CLIENT = _get_supabase()
     return _SUPABASE_CLIENT
-
 
 def _clean_secret(value):
     if value is None:
@@ -175,14 +135,7 @@ def _clean_secret(value):
             return None
     return value
 
-
 def load_credentials(mode='scanner'):
-    """
-    Returns a dict keyed by exchange name (lowercase) with:
-      'apiKey', 'secret', 'password', 'cookie'
-    For mode='scanner' we use the general columns (api_key, api_secret).
-    For mode='trader' we use the restricted columns (api_key_restricted, api_secret_restricted).
-    """
     try:
         sb = _get_supabase_cached()
         rows = sb.table("api_keys").select("*").execute()
@@ -209,26 +162,18 @@ def load_credentials(mode='scanner'):
         }
     return creds
 
-
 CREDENTIALS_SCAN = load_credentials('scanner')
 CREDENTIALS_TRADE = load_credentials('trader')
-
 
 _exchange_mode = threading.local()
 
 def set_exchange_mode(mode):
-    """mode: 'scanner' or 'trader'"""
     _exchange_mode.mode = mode
 
 def get_exchange_mode():
     return getattr(_exchange_mode, 'mode', 'scanner')
 
-
 def route_through_proxy(ex, mode):
-    """
-    Monkeypatches ex.fetch to go through the appropriate proxy.
-    mode: 'scanner' or 'trader'
-    """
     exchange_key = ex.id
     if mode == 'scanner':
         proxy_base = PROXY_BASE_SCAN
@@ -282,12 +227,7 @@ def route_through_proxy(ex, mode):
         ex.has['fetchCurrencies'] = False
     return ex
 
-
 def build_exchange(name, mode):
-    """
-    Builds a single exchange instance for the given mode.
-    Returns the ccxt exchange object.
-    """
     name_lower = name.lower()
     if mode == 'scanner':
         proxied = name_lower in PROXY_EXCHANGE_IDS_SCAN
@@ -324,8 +264,6 @@ def build_exchange(name, mode):
 
     if proxied:
         ex = route_through_proxy(ex, mode)
-        # KuCoin can't load markets through the proxy on its own — force the
-        # market list through the same proxied fetch (matches tracker.py).
         if name_lower == 'kucoin':
             try:
                 ex.set_markets(ex.fetch_markets())
@@ -342,11 +280,9 @@ def build_exchange(name, mode):
 
     return ex
 
-
 EXCHANGES_CACHE = {'scanner': {}, 'trader': {}}
 
 def ensure_exchange(name):
-    """Returns the exchange instance for the current thread's mode."""
     mode = get_exchange_mode()
     cache = EXCHANGES_CACHE[mode]
     if name in cache and cache[name] is not None:
@@ -360,12 +296,10 @@ def ensure_exchange(name):
     cache[name] = ex
     return ex
 
-
 def _clean_networks_dict(networks):
     if not isinstance(networks, dict):
         return {}
     return {code: net for code, net in networks.items() if isinstance(net, dict)}
-
 
 def _sanitize_currencies(data):
     if not isinstance(data, dict):
@@ -380,11 +314,9 @@ def _sanitize_currencies(data):
         clean[code] = cur
     return clean
 
-
 CURRENCY_CACHE = {}
 CURRENCY_CACHE_TTL = 1800
 CURRENCY_LOCKS = defaultdict(threading.Lock)
-
 
 def get_currencies(exchange_name):
     now = time.time()
@@ -409,7 +341,6 @@ def get_currencies(exchange_name):
             data = cached['data']
         CURRENCY_CACHE[exchange_name] = {'ts': now, 'data': data}
         return data
-
 
 NETWORK_ALIASES = {
     'ETH': 'ETH', 'ERC20': 'ETH', 'ETHEREUM': 'ETH', 'ETHER': 'ETH',
@@ -437,7 +368,6 @@ NETWORK_ALIASES = {
 
 _NETWORK_PAREN_RE = re.compile(r'\(([^)]+)\)\s*$')
 
-
 def normalize_network(code):
     if not code:
         return None
@@ -448,9 +378,7 @@ def normalize_network(code):
     key = raw.upper().replace('-', '').replace('_', '').replace(' ', '')
     return NETWORK_ALIASES.get(key, key)
 
-
 _NAME_JUNK_SUFFIXES = (' token', ' coin', ' protocol', ' network', ' finance', ' chain', ' project')
-
 
 def normalize_name(name):
     if not name:
@@ -461,12 +389,10 @@ def normalize_name(name):
             n = n[: -len(junk)]
     return re.sub(r'[^a-z0-9]', '', n)
 
-
 def name_is_informative(name, code):
     if not name:
         return False
     return name.strip().upper() != (code or '').strip().upper()
-
 
 def compare_names(buy_name, sell_name, code):
     buy_ok  = name_is_informative(buy_name, code)
@@ -482,9 +408,7 @@ def compare_names(buy_name, sell_name, code):
         return None, True
     return None, False
 
-
 _CONTRACT_KEYS = ('contractAddress', 'contract_address', 'contract', 'tokenAddress', 'token_address', 'address')
-
 
 def _extract_contract(network_data, currency_data=None):
     for source in (network_data, currency_data):
@@ -497,7 +421,6 @@ def _extract_contract(network_data, currency_data=None):
                 if val:
                     return val
     return None
-
 
 def _fallback_networks(exchange_name, base):
     ex = ensure_exchange(exchange_name)
@@ -514,7 +437,6 @@ def _fallback_networks(exchange_name, base):
         log.warning(f"  WARNING  {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}")
     return {}
 
-
 def _to_float(val):
     if val is None:
         return None
@@ -523,15 +445,6 @@ def _to_float(val):
     except (TypeError, ValueError):
         return None
 
-
-# ----------------------------------------------------------------------
-#  Transfer-time parsing
-# ----------------------------------------------------------------------
-# Matches strings the exchanges actually return for "Expected Arrival":
-#   "0m 13s", "5m 4s", "1m 2s", "1m 14s", "4m 10s", "13s", "5m",
-#   "1h 30m", "2 hrs 15 mins", "45 sec", "1.5h", "≈ 4m 10s", "~5m"
-# The caller strips decorative prefixes (≈, ~, about, approx, around, etc.)
-# before handing the string to the parser.
 _TIME_TEXT_RE = re.compile(
     r'(?:(?P<hours>\d+(?:\.\d+)?)\s*h(?:ou)?rs?)?[\s,]*'
     r'(?:(?P<mins>\d+(?:\.\d+)?)\s*m(?:in)?s?)?[\s,]*'
@@ -539,9 +452,6 @@ _TIME_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Fields that carry an EXPLICIT estimated time-to-arrival.  Only these are
-# trusted to produce a duration.  Confirmation counts are NOT here — see
-# _extract_confirm_hint for why.
 _TIME_KEYS = (
     'estimatedArrivalTime', 'estimated_arrival_time',
     'arrivalTime', 'arrival_time',
@@ -573,20 +483,13 @@ _CONFIRM_KEYS = (
     'minConfirmCount',
 )
 
-# Decorative junk that often prefixes a human-formatted time string.
 _TIME_PREFIX_JUNK_RE = re.compile(
     r'^\s*(?:[≈~≃≅~]|about|approx(?:\.|imately)?|around|circa|~|est(?:imated)?\.?|'
     r'expected|est\.|takes?\s+|up\s+to\s+)+[\s:]*',
     re.IGNORECASE,
 )
 
-
 def _parse_time_text_to_seconds(value):
-    """
-    Parse a human time string like "0m 13s", "5m 4s", "≈ 4m 10s" or a raw
-    numeric (which we treat as minutes) into seconds.  Returns None if
-    nothing usable can be extracted.
-    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -596,8 +499,6 @@ def _parse_time_text_to_seconds(value):
     if not text:
         return None
 
-    # Strip decorative prefixes ("≈ ", "~", "about ", "Expected: ") so the
-    # regex only sees the numeric part.
     text = _TIME_PREFIX_JUNK_RE.sub('', text).strip()
     if not text:
         return None
@@ -612,27 +513,13 @@ def _parse_time_text_to_seconds(value):
     total = hours * 3600 + mins * 60 + secs
     return total if total > 0 else None
 
-
 def _find_first_key(d, keys):
     for k in keys:
         if k in d and d[k] not in (None, ''):
             return k, d[k]
     return None, None
 
-
 def _extract_time_estimate(network_data, network_norm):
-    """
-    Return (seconds, description) for the network's estimated transfer time,
-    or (None, None) if the exchange didn't give us anything parseable.
-
-    We only trust EXPLICIT time-window fields (see _TIME_KEYS).  We never
-    derive a time from confirmation counts — block times differ wildly
-    across chains (0.3s on Arbitrum, 600s on Bitcoin, sub-second on
-    Robinhood) and exchanges routinely report confirmation counts for chains
-    we have no block-time entry for.  Doing so previously produced absurd
-    estimates (MEXC reports thousands of confirmations for the Robinhood
-    network even though SCHIFFY arrives in ~0.5s).
-    """
     if not isinstance(network_data, dict):
         return None, None
     info = network_data.get('info')
@@ -649,9 +536,7 @@ def _extract_time_estimate(network_data, network_norm):
 
     return None, None
 
-
 def _extract_confirm_hint(network_data):
-    """Best-effort description of confirmation counts, for logging only."""
     if not isinstance(network_data, dict):
         return None
     info = network_data.get('info')
@@ -664,7 +549,6 @@ def _extract_confirm_hint(network_data):
             return f"{key}={val!r}"
     return None
 
-
 def _fmt_duration(seconds):
     if seconds is None:
         return "unknown"
@@ -675,7 +559,6 @@ def _fmt_duration(seconds):
     if mins:
         return f"{mins}min"
     return f"{secs}s"
-
 
 def _fmt_networks(networks):
     if not networks or not isinstance(networks, dict):
@@ -690,7 +573,6 @@ def _fmt_networks(networks):
         parts.append(f"{code}[w={w},d={d},act={act},fee={fee},min={min_wd}]")
     suffix = "" if len(networks) <= 10 else f"  (+{len(networks) - 10} more)"
     return ", ".join(parts) + suffix
-
 
 def find_currency_by_name(exchange_name, target_name, exclude_code=None):
     currencies = get_currencies(exchange_name)
@@ -709,7 +591,6 @@ def find_currency_by_name(exchange_name, target_name, exclude_code=None):
             return code, cur
     return None
 
-
 def fetch_symbol_price(exchange_name, symbol, side):
     ex = ensure_exchange(exchange_name)
     if ex is None:
@@ -722,7 +603,6 @@ def fetch_symbol_price(exchange_name, symbol, side):
         return None
     val = t.get(side)
     return val if val else t.get('last')
-
 
 def other_deposit_blocks(base, norm_key, exclude, all_prices):
     blocked_others = []
@@ -747,10 +627,6 @@ def other_deposit_blocks(base, norm_key, exclude, all_prices):
             blocked_others.append((ex, code))
     return blocked_others
 
-
-# ----------------------------------------------------------------------
-#  Alternative-route helpers (ported from tracker.py)
-# ----------------------------------------------------------------------
 def _network_entries_matching_contract(networks, cur, contract):
     if not isinstance(networks, dict):
         return []
@@ -761,7 +637,6 @@ def _network_entries_matching_contract(networks, cur, contract):
         if (c := _extract_contract(data, cur)) and c.lower() == contract.lower()
     ]
     return out or list(networks.items())
-
 
 def meta_summary_for(exchange_name, base):
     cur = get_currencies(exchange_name).get(base)
@@ -781,7 +656,6 @@ def meta_summary_for(exchange_name, base):
         f"{exchange_name}: name={name!r}  networks: "
         f"{_fmt_networks(networks)}  contract={contract}"
     )
-
 
 def find_confirmed_pair(base, all_prices):
     info = {}
@@ -867,7 +741,6 @@ def find_confirmed_pair(base, all_prices):
     best['blocked_msgs'] = blocked_msgs
     return best
 
-
 def _route_profit(route, symbol):
     if route['direction'] == 'alt_buy':
         buy_ex_for_fee, sell_ex_for_fee = route['alt_ex'], route['sell_ex']
@@ -884,7 +757,6 @@ def _route_profit(route, symbol):
         buy_fees=buy_fees,
         sell_fees=sell_fees,
     )
-
 
 def evaluate_network_block(
     base,
@@ -1006,7 +878,6 @@ def evaluate_network_block(
 
     return max(routes, key=lambda route: route['gap_pct'])
 
-
 def _is_confirmed_tradable(r):
     if not r.get('meta_checked'):
         return False
@@ -1020,9 +891,7 @@ def _is_confirmed_tradable(r):
             return True
     return False
 
-
 def check_metadata(r):
-    """Confirms name/network/contract match for the given pair."""
     base = r['symbol'].split('/')[0]
     buy_ex, sell_ex = r['buy_ex'], r['sell_ex']
     other_exchanges = sorted(ex for ex in r['all_prices'] if ex not in (buy_ex, sell_ex))
@@ -1213,11 +1082,6 @@ def check_metadata(r):
         r['withdrawal_fee']        = _to_float(buy_data.get('fee'))
         r['withdrawal_min_tokens'] = _to_float(((buy_data.get('limits') or {}).get('withdraw') or {}).get('min'))
 
-        # ---- Transfer time ----
-        # Parse the exchange-provided arrival estimate for each leg.  If a
-        # leg's time is unknown we do NOT guess from confirmation counts —
-        # we fall back to MAX_TRANSFER_TIME_SEC (the ceiling) so the pair
-        # is allowed through.
         withdraw_secs, withdraw_desc = _extract_time_estimate(buy_data, r['withdrawal_network_norm'])
         deposit_secs,  deposit_desc  = _extract_time_estimate(sell_data, r['withdrawal_network_norm'])
         r['transfer_withdraw_seconds'] = withdraw_secs
@@ -1227,21 +1091,15 @@ def check_metadata(r):
         known_total = sum(known_parts)
 
         if known_total > MAX_TRANSFER_TIME_SEC:
-            # Explicitly over the ceiling on at least one leg — reject.
             r['transfer_seconds'] = known_total
             r['transfer_time_estimated'] = False
         elif len(known_parts) == 2:
-            # Both legs have explicit times within the ceiling.
             r['transfer_seconds'] = known_total
             r['transfer_time_estimated'] = False
         else:
-            # One or both legs have no parseable time.  Assume the worst
-            # case that is still allowed (MAX_TRANSFER_TIME_SEC) so missing
-            # data never causes a rejection.
             r['transfer_seconds'] = MAX_TRANSFER_TIME_SEC
             r['transfer_time_estimated'] = True
 
-        # Descriptive string for logging.
         desc_parts = []
         if withdraw_secs is not None:
             desc_parts.append(f"withdraw ~{_fmt_duration(withdraw_secs)} ({withdraw_desc})")
@@ -1287,20 +1145,14 @@ def check_metadata(r):
         r['confirmed_pair'] = find_confirmed_pair(base, r['all_prices'])
     return r
 
-
-# ----------------------------------------------------------------------
-#  Live taker fee system (ported from tracker.py)
-# ----------------------------------------------------------------------
 _FEE_CACHE = {}
 _FEE_CACHE_LOCK = threading.Lock()
-
 
 def _valid_fee(val):
     v = _to_float(val)
     if v is None or v != v or v < 0:
         return None
     return v
-
 
 def _cache_get(key, ttl):
     with _FEE_CACHE_LOCK:
@@ -1309,11 +1161,9 @@ def _cache_get(key, ttl):
         return hit
     return None
 
-
 def _cache_put(key, value):
     with _FEE_CACHE_LOCK:
         _FEE_CACHE[key] = (time.time(), value)
-
 
 def _find_key(obj, names):
     if isinstance(obj, dict):
@@ -1331,10 +1181,7 @@ def _find_key(obj, names):
                 return found
     return None
 
-
 def _bingx_spot_taker_fee(ex, symbol):
-    # ccxt's BingX fetchTradingFee reads the futures commission endpoint and
-    # returns no rate for spot pairs, so call the spot endpoint directly.
     if not ex.markets:
         ex.load_markets()
     market = ex.market(symbol)
@@ -1349,11 +1196,9 @@ def _bingx_spot_taker_fee(ex, symbol):
     response = method({'symbol': market['id']})
     return _find_key(response, ('takerCommissionRate', 'taker'))
 
-
 EXCHANGE_FEE_FETCHERS = {
     'BingX': _bingx_spot_taker_fee,
 }
-
 
 def _fetch_pair_taker_fee(exchange_name, symbol):
     ex = ensure_exchange(exchange_name)
@@ -1402,13 +1247,7 @@ def _fetch_pair_taker_fee(exchange_name, symbol):
         errors.append("exchange has no fee endpoint in ccxt")
     return None, "; ".join(errors)
 
-
 def get_taker_fee(exchange_name, symbol):
-    """
-    Returns a dict {'exchange': name, 'taker': rate} on success, else None.
-    Live taker fee is fetched from the exchange (private endpoints);
-    no hardcoded / fallback rate is ever assumed.
-    """
     key = (exchange_name, symbol)
     ok = _cache_get(key, FEE_CACHE_TTL_SEC)
     if ok is not None and ok[1] is not None:
@@ -1429,15 +1268,10 @@ def get_taker_fee(exchange_name, symbol):
     _cache_put(key, fees)
     return fees
 
-
-# ----------------------------------------------------------------------
-#  Order book helpers
-# ----------------------------------------------------------------------
 def _sort_book_side(levels, side):
     if not levels:
         return []
     return sorted(levels, key=lambda lvl: lvl[0], reverse=(side == 'bids'))
-
 
 def walk_book(levels, target_usdt):
     filled_quote = 0.0
@@ -1461,7 +1295,6 @@ def walk_book(levels, target_usdt):
         return None, 0.0, False
     return filled_quote / filled_base, filled_quote, False
 
-
 def _fetch_order_book_safe(exchange_name, venue, symbol):
     params   = EXTRA_PARAMS.get(exchange_name, {})
     last_err = None
@@ -1480,7 +1313,6 @@ def _fetch_order_book_safe(exchange_name, venue, symbol):
         f"(failed all {DEPTH_FETCH_RETRIES} attempts): {err_summary}"
     )
     return None
-
 
 def check_depth(r):
     buy_ex, sell_ex, symbol = r['buy_ex'], r['sell_ex'], r['symbol']
@@ -1512,22 +1344,16 @@ def check_depth(r):
     r['depth_ok']         = buy_ok and sell_ok
     return r
 
-
 def fmt_price(p):
     if   p >= 1:      return f"${p:,.4f}"
     elif p >= 0.0001: return f"${p:.6f}"
     else:             return f"${p:.8f}"
-
 
 def fmt_vol(v):
     if   v >= 1_000_000: return f"${v/1_000_000:.2f}M"
     elif v >= 1_000:     return f"${v/1_000:.1f}K"
     else:                return f"${v:.0f}"
 
-
-# ----------------------------------------------------------------------
-#  Profit calculation (tracker-style: token-based buy fee, taker-fee dicts)
-# ----------------------------------------------------------------------
 def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
                     min_withdrawal_tokens=None,
                     buy_fees=None, sell_fees=None):
@@ -1586,7 +1412,6 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
         'roi_pct':                roi_pct,
     }
 
-
 def log_profit_block(profit, symbol=None):
     if not profit:
         log.info("       PROFIT not calculated (taker fee unavailable — see warning above)")
@@ -1619,7 +1444,6 @@ def log_profit_block(profit, symbol=None):
     log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
     log.info(f"       PROFIT ROI {profit['roi_pct']:+.2f}%")
 
-
 TRADE_COINS_REQUIRED_FIELDS = (
     'pair', 'exchange', 'coin_wd_network', 'arrival_time', 'usdt_holder',
     'usdt_transfer_fee', 'usdt_d_address', 'coin_d_address',
@@ -1627,12 +1451,6 @@ TRADE_COINS_REQUIRED_FIELDS = (
 )
 
 def save_trade_coin(r, profit):
-    """
-    Build the filtered trade_coins row from a fully-verified (r, profit)
-    pair and upsert it into Supabase (keyed on `pair`, so re-verifying the
-    same pair updates its row instead of piling up duplicates). Skips
-    saving entirely if any required field is missing.
-    """
     if not r or not profit:
         return
 
@@ -1647,7 +1465,6 @@ def save_trade_coin(r, profit):
     if transfer_secs is None:
         arrival_time = None
     elif r.get('transfer_time_estimated'):
-        # Unknown → we assumed the ceiling; make that explicit in the label.
         arrival_time = f"est. ≤{_fmt_duration(transfer_secs)} (assumed)"
     else:
         arrival_time = f"est. {_fmt_duration(transfer_secs)}"
@@ -1699,7 +1516,6 @@ def save_trade_coin(r, profit):
     except Exception as e:
         log.warning(f"  WARNING  saving trade_coins ({pair}): {str(e)[:150]}")
 
-
 def fetch_arb_coins_rows():
     try:
         sb = _get_supabase_cached()
@@ -1709,7 +1525,6 @@ def fetch_arb_coins_rows():
         log.warning(f"  WARNING  arb_coins fetch: {str(e)[:200]}")
         return []
 
-
 def delete_arb_coin(symbol):
     try:
         sb = _get_supabase_cached()
@@ -1717,7 +1532,6 @@ def delete_arb_coin(symbol):
         log.info(f"[worker1] 🗑️  removed {symbol} from arb_coins")
     except Exception as e:
         log.warning(f"  WARNING  arb_coins delete for {symbol}: {str(e)[:200]}")
-
 
 def load_exchange_config() -> dict:
     try:
@@ -1740,7 +1554,6 @@ def load_exchange_config() -> dict:
         }
     return cfg
 
-
 def load_bot_state() -> dict:
     try:
         sb = _get_supabase_cached()
@@ -1750,7 +1563,6 @@ def load_bot_state() -> dict:
     except Exception as e:
         log.warning(f"  WARNING  bot_state fetch: {str(e)[:200]}")
         return {}
-
 
 def load_addresses() -> dict:
     try:
@@ -1789,7 +1601,6 @@ def load_addresses() -> dict:
         }
     return out
 
-
 EVM_NETWORKS = {'ETH', 'BSC', 'MATIC', 'ARB', 'OP', 'BASE', 'CELO', 'PLASMA'}
 
 ADDRESS_COLUMN_FOR_NETWORK = {
@@ -1813,7 +1624,6 @@ ADDRESS_COLUMN_FOR_NETWORK = {
     'CELO':   'CELO',
 }
 
-
 def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
     row = addresses_cfg.get(exchange_name)
     if row is None:
@@ -1823,7 +1633,6 @@ def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
         return True
     whitelisted_norm = {normalize_network(n) for n in row['whitelisted_network']}
     return norm in whitelisted_norm
-
 
 def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, exchange_cfg, addresses):
     sender_cfg = exchange_cfg.get(sender_ex.lower()) or {}
@@ -1853,7 +1662,6 @@ def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, excha
         return True, f"{network_norm} is explicitly whitelisted on {sender_ex}"
     return False, f"{network_norm} is not whitelisted on {sender_ex}"
 
-
 def get_usdt_network_data(exchange_name):
     currencies = get_currencies(exchange_name)
     usdt_cur = currencies.get('USDT') or {}
@@ -1881,7 +1689,6 @@ def get_usdt_network_data(exchange_name):
 
     return networks
 
-
 def _networks_by_norm(networks_raw, enabled_key):
     by_norm = defaultdict(list)
     for code, data in networks_raw.items():
@@ -1891,7 +1698,6 @@ def _networks_by_norm(networks_raw, enabled_key):
         if enabled:
             by_norm[normalize_network(code)].append((code, data))
     return by_norm
-
 
 def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
     if holder_ex == buy_ex:
@@ -1978,7 +1784,6 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
     _, network_code, fee = min(within_cap, key=lambda c: c[2])
     return {'ok': True, 'network': network_code, 'fee_usdt': fee}
 
-
 EXTRA_PARAMS = {'Bybit': {'category': 'spot'}}
 
 def fetch_ticker_data(exchange_name, symbol):
@@ -1999,7 +1804,6 @@ def fetch_ticker_data(exchange_name, symbol):
     if bid <= 0: bid = last
     if ask <= 0: ask = last
     return {'price': last, 'bid': bid, 'ask': ask, 'volume': volume, 'change': change}
-
 
 def fetch_tickers_grouped(needed):
     results = {}
@@ -2024,7 +1828,6 @@ def fetch_tickers_grouped(needed):
             except Exception as e:
                 log.warning(f"  WARNING  batched ticker fetch for {exchange_name}: {str(e)[:200]}")
     return results
-
 
 def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
     buy_price, sell_price = buy_data['ask'], sell_data['bid']
@@ -2084,18 +1887,10 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
         'corrected_sell_depth_price': None,
     }
 
-
 def _check_transfer_time(r):
-    """
-    Reject only when the exchange EXPLICITLY reported a transfer time above
-    the ceiling.  Unknown times were already filled in with
-    MAX_TRANSFER_TIME_SEC by check_metadata, so they pass here by design.
-    """
     seconds = r.get('transfer_seconds')
     if seconds is None or seconds <= MAX_TRANSFER_TIME_SEC:
         return None
-    # Distinguish "explicitly too slow" from the assumed-ceiling case; the
-    # latter never exceeds MAX so it can't reach this branch.
     return {
         'ok': False,
         'reason': (
@@ -2104,7 +1899,6 @@ def _check_transfer_time(r):
         ),
         'r': r, 'profit': None, 'delete': True,
     }
-
 
 def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
     try:
@@ -2146,7 +1940,6 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         log.warning(f"  WARNING  light verify({symbol}, {buy_ex_name}->{sell_ex_name}): {type(e).__name__}: {str(e)[:300]}")
         return {'ok': False, 'reason': f"unexpected error: {str(e)[:150]}", 'r': None, 'profit': None}
 
-
 def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                  exchange_cfg, addresses, holder_ex):
     try:
@@ -2155,8 +1948,6 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
             return {'ok': False, 'reason': 'invalid ask/bid price data', 'r': None, 'profit': None}
 
-        # Fail closed on exchanges missing from exchange_config — this covers
-        # the window where worker1 hasn't run its next filter pass yet.
         for ex in (buy_ex_name, sell_ex_name):
             if ex.lower() not in exchange_cfg:
                 return {
@@ -2277,9 +2068,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         log.warning(f"  WARNING  full verify({symbol}, {buy_ex_name}->{sell_ex_name}): {type(e).__name__}: {str(e)[:300]}")
         return {'ok': False, 'reason': f"unexpected error: {str(e)[:150]}", 'r': None, 'profit': None}
 
-
 def reverify_pair(symbol, buy_ex_name, sell_ex_name):
-    """Worker2: one-off full verification using the trader pool."""
     old_mode = get_exchange_mode()
     set_exchange_mode('trader')
     try:
@@ -2292,7 +2081,6 @@ def reverify_pair(symbol, buy_ex_name, sell_ex_name):
                             exchange_cfg, addresses, holder_ex)
     finally:
         set_exchange_mode(old_mode)
-
 
 def print_pair_report_full(r, profit):
     log.info(f"{r['symbol']}  |  gap {r['gap_pct']:.2f}%  |  {r['n_exchanges']} exchanges")
@@ -2394,7 +2182,6 @@ def print_pair_report_full(r, profit):
         log.info(f"       META   {extra_summary}")
     log.info("")
 
-
 class ActiveTrade:
     def __init__(self):
         self._lock = threading.Lock()
@@ -2424,10 +2211,8 @@ class ActiveTrade:
             if self._active and self._active['symbol'] == symbol:
                 self._active = None
 
-
 active_trade = ActiveTrade()
 fail_streaks = defaultdict(int)
-
 
 def worker1_loop():
     log.info(f"[worker1] started — scanning arb_coins every {WORKER1_INTERVAL_SEC}s (scanner mode)")
@@ -2452,9 +2237,6 @@ def worker1_loop():
                 buy_cfg  = exchange_cfg.get(buy_ex.lower())
                 sell_cfg = exchange_cfg.get(sell_ex.lower())
 
-                # exchange_config is the authoritative allow-list. A missing row
-                # means the exchange is out of rotation (e.g. removed from
-                # tracker.py), so the pair is dropped immediately.
                 if buy_cfg is None or sell_cfg is None:
                     missing = buy_ex if buy_cfg is None else sell_ex
                     log.info(f"[worker1] 🗑️  {symbol}: {missing} has no exchange_config row — removing")
@@ -2547,7 +2329,6 @@ def worker1_loop():
             log.error(f"[worker1] unexpected error: {e}")
         time.sleep(WORKER1_INTERVAL_SEC)
 
-
 def worker2_loop():
     log.info("[worker2] started — waits idle, runs once each time worker1 hands off a new pair (trader mode)")
 
@@ -2574,7 +2355,6 @@ def worker2_loop():
         except Exception as e:
             log.error(f"[worker2] unexpected error: {e}")
 
-
 def main():
     log.info("trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)")
     log.info(f"worker1 interval: {WORKER1_INTERVAL_SEC}s  |  worker2: event-driven")
@@ -2599,7 +2379,6 @@ def main():
             time.sleep(3600)
     except KeyboardInterrupt:
         log.info("trader.py stopped.")
-
 
 if __name__ == "__main__":
     main()
