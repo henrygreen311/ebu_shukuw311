@@ -1,0 +1,30 @@
+trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)
+worker1 interval: 300s  |  worker2: event-driven
+Min qualifying profit: $0.001  |  fail-streak limit: 3
+Capital: 1000 USDT  |  depth check: 1000 USDT
+Scanner mode: uses general API keys, proxies Bybit+KuCoin via arb-bot
+Trader mode: uses restricted API keys, proxies via trade-proxy
+Taker fees: fetched live per pair (no hardcoded fallback)
+
+[worker1] started — scanning arb_coins every 300s (scanner mode)
+[worker2] started — waits idle, runs once each time worker1 hands off a new pair (trader mode)
+  WARNING  exchange_config fetch: {'message': "Could not find the table 'public.exchange_config' in the schema cache", 'code': 'PGRST205', 'hint': "Perhaps you meant the table 'public.trade_coins'", 'details': None}
+trader.py stopped.
+trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)
+worker1 interval: 300s  |  worker2: event-driven
+Min qualifying profit: $1  |  fail-streak limit: 3
+Capital: 100 USDT  |  depth check: 100 USDT
+Scanner mode: uses general API keys, proxies Bybit+KuCoin via arb-bot
+Trader mode: uses restricted API keys, proxies via trade-proxy
+Taker fees: fetched live per pair (no hardcoded fallback)
+
+[worker1] started — scanning arb_coins every 300s (scanner mode)
+[worker2] started — waits idle, runs once each time worker1 hands off a new pair (trader mode)
+[worker1] 🗑️  RIZ/USDT: KuCoin is buy-only but used as sell side — removing
+[worker1] 🗑️  removed RIZ/USDT from arb_coins
+[worker1] 🗑️  RVN/USDT: OKX is disabled in exchange_config — removing
+[worker1] 🗑️  removed RVN/USDT from arb_coins
+[worker1] 🗑️  SUNDOG/USDT: KuCoin is buy-only but used as sell side — removing
+[worker1] 🗑️  removed SUNDOG/USDT from arb_coins
+trader.py stopped.
+[worker1] unexpected error: cannot schedule new futures after interpreter shutdown

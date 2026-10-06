@@ -15,13 +15,15 @@ PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"
 PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php"
 
 
-PROXY_EXCHANGES_SCAN = {'Bybit'}
+PROXY_EXCHANGES_SCAN = {'Bybit', 'KuCoin'}
 PROXY_EXCHANGES_TRADE = {
     'Bybit', 'Bitget', 'MEXC', 'BingX',
-    'CoinEx', 'OKX',
+    'OKX', 'KuCoin',
 }
 PROXY_EXCHANGE_IDS_SCAN = {name.lower() for name in PROXY_EXCHANGES_SCAN}
 PROXY_EXCHANGE_IDS_TRADE = {name.lower() for name in PROXY_EXCHANGES_TRADE}
+
+EXCHANGE_HOSTNAME_OVERRIDES = {}
 
 
 _PROXY_HEADERS = {
@@ -43,10 +45,12 @@ PROXY_TIMEOUT_MS = 20_000
 RETRY_ATTEMPTS = 1
 RETRY_DELAY = 1
 
-CAPITAL_USD     = 1000
-DEPTH_CHECK_USD = 1000
-MIN_STORE_PROFIT_USD = 0.001
-DEFAULT_TAKER_FEE = 0.001
+CAPITAL_USDT     = 100
+DEPTH_CHECK_USDT = 100
+MIN_STORE_PROFIT_USDT = 1
+
+FEE_CACHE_TTL_SEC = 60 * 60
+FEE_RETRY_AFTER_FAIL_SEC = 60
 
 
 MAX_TRANSFER_TIME_SEC = 5 * 60
@@ -60,7 +64,9 @@ NETWORK_BLOCK_TIME_SEC = {
 DEFAULT_BLOCK_TIME_SEC = 15
 
 ORDER_BOOK_LIMIT = 50
-ORDER_BOOK_LIMIT_OVERRIDES = {}
+ORDER_BOOK_LIMIT_OVERRIDES = {
+    'KuCoin': 100,
+}
 
 def order_book_limit_for(exchange_name):
     return ORDER_BOOK_LIMIT_OVERRIDES.get(exchange_name, ORDER_BOOK_LIMIT)
@@ -142,17 +148,11 @@ def _clean_secret(value):
 
 
 def load_credentials(mode='scanner'):
-    """
-    Returns a dict keyed by exchange name (lowercase) with:
-      'apiKey', 'secret', 'password', 'cookie'
-    For mode='scanner' we use the general columns (api_key, api_secret).
-    For mode='trader' we use the restricted columns (api_key_restricted, api_secret_restricted).
-    """
     try:
         sb = _get_supabase_cached()
         rows = sb.table("api_keys").select("*").execute()
     except Exception as e:
-        log.warning(f"  WARNING  Supabase credentials: {str(e)[:150]}")
+        log.warning(f"[warn] supabase credentials: {str(e)[:150]}")
         return {}
     creds = {}
     for row in rows.data or []:
@@ -182,7 +182,6 @@ CREDENTIALS_TRADE = load_credentials('trader')
 _exchange_mode = threading.local()
 
 def set_exchange_mode(mode):
-    """mode: 'scanner' or 'trader'"""
     _exchange_mode.mode = mode
 
 def get_exchange_mode():
@@ -190,10 +189,6 @@ def get_exchange_mode():
 
 
 def route_through_proxy(ex, mode):
-    """
-    Monkeypatches ex.fetch to go through the appropriate proxy.
-    mode: 'scanner' or 'trader'
-    """
     exchange_key = ex.id
     if mode == 'scanner':
         proxy_base = PROXY_BASE_SCAN
@@ -205,10 +200,7 @@ def route_through_proxy(ex, mode):
         proxy_cookie = creds.get('cookie')
 
     if not proxy_cookie:
-        log.warning(
-            f"  WARNING  no proxy cookie found for '{exchange_key}' in mode {mode} "
-            f"— InfinityFree's bot-check may block requests"
-        )
+        log.warning(f"[warn] no proxy cookie for {exchange_key} ({mode}) — bot-check may block")
     proxy_cookies = {"__test": proxy_cookie} if proxy_cookie else {}
 
     def proxied_fetch(url, method='GET', headers=None, body=None):
@@ -216,6 +208,7 @@ def route_through_proxy(ex, mode):
         request_headers = dict(headers or {})
         request_headers.update(_PROXY_HEADERS)
         request_headers['X-Proxy-Target-Host'] = parsed.netloc
+        request_headers['X-Proxy-Exchange'] = exchange_key
         new_url = f"{proxy_base}/{exchange_key}{parsed.path}"
         if parsed.query:
             new_url += f"?{parsed.query}"
@@ -236,7 +229,6 @@ def route_through_proxy(ex, mode):
             except ValueError:
                 return resp.text
 
-
         try:
             return do_request()
         except Exception:
@@ -249,16 +241,11 @@ def route_through_proxy(ex, mode):
 
 
 def build_exchange(name, mode):
-    """
-    Builds a single exchange instance for the given mode.
-    Returns the ccxt exchange object.
-    """
     name_lower = name.lower()
     if mode == 'scanner':
         proxied = name_lower in PROXY_EXCHANGE_IDS_SCAN
         creds = CREDENTIALS_SCAN.get(name_lower, {})
         timeout = PROXY_TIMEOUT_MS if proxied else TIMEOUT_MS
-
     else:
         proxied = name_lower in PROXY_EXCHANGE_IDS_TRADE
         creds = CREDENTIALS_TRADE.get(name_lower, {})
@@ -269,6 +256,11 @@ def build_exchange(name, mode):
         'timeout': timeout,
         'options': {'adjustForTimeDifference': True},
     }
+
+    hostname_override = EXCHANGE_HOSTNAME_OVERRIDES.get(name_lower)
+    if hostname_override:
+        cfg['hostname'] = hostname_override
+
     if creds.get('apiKey'):
         cfg['apiKey'] = creds['apiKey']
     if creds.get('secret'):
@@ -278,7 +270,6 @@ def build_exchange(name, mode):
     if creds.get('uid'):
         cfg['uid'] = creds['uid']
 
-
     exchange_class = getattr(ccxt, name_lower, None)
     if exchange_class is None:
         raise ValueError(f"Unsupported exchange: {name}")
@@ -286,15 +277,19 @@ def build_exchange(name, mode):
 
     if proxied:
         ex = route_through_proxy(ex, mode)
-
+        if name_lower == 'kucoin':
+            try:
+                ex.set_markets(ex.fetch_markets())
+            except Exception as e:
+                log.warning(f"[warn] kucoin set_markets failed: {str(e)[:300]}")
 
     if not proxied:
         try:
             ex.load_markets()
             if not ex.markets:
-                log.warning(f"  WARNING  {name}: load_markets() returned 0 markets")
+                log.warning(f"[warn] {name}: load_markets returned 0 markets")
         except Exception as e:
-            log.warning(f"  WARNING  {name}: load_markets() failed — {str(e)[:400]}")
+            log.warning(f"[warn] {name}: load_markets failed — {str(e)[:400]}")
 
     return ex
 
@@ -302,7 +297,6 @@ def build_exchange(name, mode):
 EXCHANGES_CACHE = {'scanner': {}, 'trader': {}}
 
 def ensure_exchange(name):
-    """Returns the exchange instance for the current thread's mode."""
     mode = get_exchange_mode()
     cache = EXCHANGES_CACHE[mode]
     if name in cache and cache[name] is not None:
@@ -310,7 +304,7 @@ def ensure_exchange(name):
     try:
         ex = with_retries(lambda: build_exchange(name, mode), f"{name} ({mode})")
     except Exception as e:
-        log.warning(f"  WARNING  {name} ({mode}): could not initialize — {str(e)[:400]}")
+        log.warning(f"[warn] {name} ({mode}): could not init — {str(e)[:400]}")
         cache[name] = None
         return None
     cache[name] = ex
@@ -359,7 +353,7 @@ def get_currencies(exchange_name):
             data = ex.fetch_currencies() or {}
             data = _sanitize_currencies(data)
         except Exception as e:
-            log.warning(f"  WARNING  {exchange_name} currencies: {str(e)[:120]}")
+            log.warning(f"[warn] {exchange_name} currencies: {str(e)[:120]}")
             data = {}
         if not data and cached:
             data = cached['data']
@@ -386,6 +380,7 @@ NETWORK_ALIASES = {
     'DOGE': 'DOGE', 'DOGECOIN': 'DOGE',
     'LTC': 'LTC', 'LITECOIN': 'LTC',
     'ZKSYNC': 'ZKSYNC', 'ZKSYNCERA': 'ZKSYNC',
+    'ROBINHOOD': 'ROBINHOOD', 'ROBINHOODCHAIN': 'ROBINHOOD',
 }
 
 _NETWORK_PAREN_RE = re.compile(r'\(([^)]+)\)\s*$')
@@ -464,7 +459,7 @@ def _fallback_networks(exchange_name, base):
             fee_data = ex.fetch_deposit_withdraw_fees([base])
             return _clean_networks_dict(((fee_data or {}).get(base) or {}).get('networks') or {})
     except Exception as e:
-        log.warning(f"  WARNING  {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}")
+        log.warning(f"[warn] {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}")
     return {}
 
 
@@ -503,8 +498,6 @@ def _parse_time_text_to_seconds(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
-
-
         return float(value) * 60 if value > 0 else None
     text = str(value).strip()
     if not text:
@@ -527,16 +520,10 @@ def _find_first_key(d, keys):
 
 
 def _extract_time_estimate(network_data, network_norm):
-    """
-    Returns (seconds, description) estimating how long a deposit/withdrawal on
-    this network is expected to take, or (None, None) if nothing usable was
-    found. Checks the network dict itself and its raw 'info' payload.
-    """
     if not isinstance(network_data, dict):
         return None, None
     info = network_data.get('info')
     info = info if isinstance(info, dict) else {}
-
 
     for source in (network_data, info):
         if not isinstance(source, dict):
@@ -546,7 +533,6 @@ def _extract_time_estimate(network_data, network_norm):
             seconds = _parse_time_text_to_seconds(val)
             if seconds is not None:
                 return seconds, f"{key}={val!r}"
-
 
     for source in (network_data, info):
         if not isinstance(source, dict):
@@ -619,7 +605,7 @@ def fetch_symbol_price(exchange_name, symbol, side):
         params = EXTRA_PARAMS.get(exchange_name, {})
         t = ex.fetch_ticker(symbol, params=params)
     except Exception as e:
-        log.warning(f"  WARNING  {exchange_name} fetch_ticker({symbol}): {str(e)[:400]}")
+        log.warning(f"[warn] {exchange_name} ticker {symbol}: {str(e)[:400]}")
         return None
     val = t.get(side)
     return val if val else t.get('last')
@@ -649,12 +635,281 @@ def other_deposit_blocks(base, norm_key, exclude, all_prices):
     return blocked_others
 
 
+def _network_entries_matching_contract(networks, cur, contract):
+    if not isinstance(networks, dict):
+        return []
+    if not contract:
+        return list(networks.items())
+    out = [
+        (code, data) for code, data in networks.items()
+        if (c := _extract_contract(data, cur)) and c.lower() == contract.lower()
+    ]
+    return out or list(networks.items())
+
+
+def meta_summary_for(exchange_name, base):
+    cur = get_currencies(exchange_name).get(base)
+    if not isinstance(cur, dict):
+        return f"{exchange_name}: '{base}' currency data is not a dict (type {type(cur).__name__})"
+    name = (cur.get('name') or '').strip()
+    networks = cur.get('networks') or {}
+    if not networks:
+        networks = _fallback_networks(exchange_name, base)
+    contract = None
+    for net_data in networks.values():
+        if isinstance(net_data, dict):
+            contract = _extract_contract(net_data, cur)
+            if contract:
+                break
+    return (
+        f"{exchange_name}: name={name!r}  networks: "
+        f"{_fmt_networks(networks)}  contract={contract}"
+    )
+
+
+def find_confirmed_pair(base, all_prices):
+    info = {}
+    for ex in all_prices:
+        cur = get_currencies(ex).get(base)
+        if not isinstance(cur, dict):
+            continue
+        name = (cur.get('name') or '').strip()
+        if not name_is_informative(name, base):
+            continue
+        info[ex] = (name, cur)
+    ex_list = list(info.keys())
+    matched_pairs = []
+    for i in range(len(ex_list)):
+        for j in range(i + 1, len(ex_list)):
+            ex1, ex2 = ex_list[i], ex_list[j]
+            n1, cur1 = info[ex1]
+            n2, cur2 = info[ex2]
+            if normalize_name(n1) == normalize_name(n2):
+                matched_pairs.append((ex1, ex2, cur1, cur2))
+    if not matched_pairs:
+        return None
+
+    best = None
+    for ex1, ex2, cur1, cur2 in matched_pairs:
+        p1, p2 = all_prices.get(ex1, {}).get('price'), all_prices.get(ex2, {}).get('price')
+        if not p1 or not p2 or p1 == p2:
+            continue
+        if p1 < p2:
+            buy_c, sell_c, buy_p, sell_p, buy_cur, sell_cur = ex1, ex2, p1, p2, cur1, cur2
+        else:
+            buy_c, sell_c, buy_p, sell_p, buy_cur, sell_cur = ex2, ex1, p2, p1, cur2, cur1
+        gap_pct = ((sell_p - buy_p) / buy_p) * 100
+        if best is None or gap_pct > best['gap_pct']:
+            best = {
+                'buy_ex': buy_c, 'sell_ex': sell_c,
+                'buy_price': buy_p, 'sell_price': sell_p,
+                'gap_pct': gap_pct,
+                'buy_cur': buy_cur, 'sell_cur': sell_cur,
+            }
+    if best is None:
+        return None
+
+    buy_networks = best['buy_cur'].get('networks') or {}
+    if not buy_networks:
+        buy_networks = _fallback_networks(best['buy_ex'], base)
+    sell_networks = best['sell_cur'].get('networks') or {}
+    if not sell_networks:
+        sell_networks = _fallback_networks(best['sell_ex'], base)
+    buy_by_norm = defaultdict(list)
+    for code, data in buy_networks.items():
+        buy_by_norm[normalize_network(code)].append((code, data))
+    sell_by_norm = defaultdict(list)
+    for code, data in sell_networks.items():
+        sell_by_norm[normalize_network(code)].append((code, data))
+    tradable_network = None
+    blocked_msgs = []
+    for norm_key, buy_entries in buy_by_norm.items():
+        sell_entries = sell_by_norm.get(norm_key)
+        if not sell_entries:
+            continue
+        buy_code, buy_data = buy_entries[0]
+        sell_code, sell_data = sell_entries[0]
+        can_withdraw = buy_data.get('withdraw', True) is not False and buy_data.get('active', True) is not False
+        can_deposit  = sell_data.get('deposit', True) is not False and sell_data.get('active', True) is not False
+        if can_withdraw and can_deposit:
+            tradable_network = norm_key
+            tradable_fee = _to_float(buy_data.get('fee'))
+            tradable_min = _to_float(((buy_data.get('limits') or {}).get('withdraw') or {}).get('min'))
+            best['min_withdrawal'] = tradable_min
+            best['fee'] = tradable_fee
+            break
+        else:
+            if not can_withdraw:
+                blocked_msgs.append(f"{best['buy_ex']} withdraw disabled for {buy_code}")
+            if not can_deposit:
+                blocked_msgs.append(f"{best['sell_ex']} deposit disabled for {sell_code}")
+    else:
+        tradable_fee = None
+        best['min_withdrawal'] = None
+        best['fee'] = None
+    best['tradable_network'] = tradable_network
+    best['blocked_msgs'] = blocked_msgs
+    return best
+
+
+def _route_profit(route, symbol):
+    if route['direction'] == 'alt_buy':
+        buy_ex_for_fee, sell_ex_for_fee = route['alt_ex'], route['sell_ex']
+        buy_price, sell_price = route['alt_price'], route['sell_price_ref']
+    else:
+        buy_ex_for_fee, sell_ex_for_fee = route['buy_ex'], route['alt_ex']
+        buy_price, sell_price = route['buy_price_ref'], route['alt_price']
+    buy_fees  = get_taker_fee(buy_ex_for_fee, symbol)
+    sell_fees = get_taker_fee(sell_ex_for_fee, symbol)
+    return calc_arb_profit(
+        CAPITAL_USDT, buy_price, sell_price,
+        fee_tokens=route.get('fee'),
+        min_withdrawal_tokens=route.get('min_withdrawal'),
+        buy_fees=buy_fees,
+        sell_fees=sell_fees,
+    )
+
+
+def evaluate_network_block(
+    base,
+    buy_ex,
+    sell_ex,
+    buy_price,
+    sell_price,
+    all_prices,
+    blocked_details,
+    contract=None,
+    symbol=None,
+):
+    other_exchanges = sorted(ex for ex in all_prices if ex not in (buy_ex, sell_ex))
+    if not other_exchanges:
+        return None
+
+    routes = []
+
+    for entry in blocked_details:
+        norm_key = entry['norm_key']
+
+        if not entry['can_withdraw'] and entry['can_deposit']:
+            for alt_ex in other_exchanges:
+                alt_price = all_prices.get(alt_ex, {}).get('ask')
+                if not alt_price or alt_price <= 0 or alt_price >= sell_price:
+                    continue
+                gap_pct = ((sell_price - alt_price) / alt_price) * 100
+                if gap_pct < 0:
+                    continue
+                cur = get_currencies(alt_ex).get(base)
+                if not isinstance(cur, dict):
+                    continue
+                networks = cur.get('networks') or {}
+                if not networks:
+                    networks = _fallback_networks(alt_ex, base)
+                candidates = _network_entries_matching_contract(networks, cur, contract)
+                matched = next(
+                    (c_d for c_d in candidates if normalize_network(c_d[0]) == norm_key),
+                    None,
+                )
+                if not matched:
+                    continue
+                code, data = matched
+                withdraw_ok = (
+                    data.get('withdraw', True) is not False
+                    and data.get('active', True) is not False
+                )
+                if withdraw_ok:
+                    routes.append({
+                        'direction': 'alt_buy',
+                        'blocked_ex': buy_ex,
+                        'alt_ex': alt_ex,
+                        'sell_ex': sell_ex,
+                        'network': norm_key,
+                        'gap_pct': gap_pct,
+                        'alt_price': alt_price,
+                        'sell_price_ref': sell_price,
+                        'fee': _to_float(data.get('fee')),
+                        'min_withdrawal': _to_float(
+                            ((data.get('limits') or {}).get('withdraw') or {}).get('min')
+                        ),
+                        'blocked_reason': f"{buy_ex} withdraw disabled for {norm_key}",
+                    })
+
+        if entry['can_withdraw'] and not entry['can_deposit']:
+            for alt_ex in other_exchanges:
+                alt_price = all_prices.get(alt_ex, {}).get('bid')
+                if not alt_price or alt_price <= buy_price:
+                    continue
+                gap_pct = ((alt_price - buy_price) / buy_price) * 100
+                if gap_pct < 0:
+                    continue
+                cur = get_currencies(alt_ex).get(base)
+                if not isinstance(cur, dict):
+                    continue
+                networks = cur.get('networks') or {}
+                if not networks:
+                    networks = _fallback_networks(alt_ex, base)
+                candidates = _network_entries_matching_contract(networks, cur, contract)
+                matched = next(
+                    (c_d for c_d in candidates if normalize_network(c_d[0]) == norm_key),
+                    None,
+                )
+                if not matched:
+                    continue
+                code, data = matched
+                deposit_ok = (
+                    data.get('deposit', True) is not False
+                    and data.get('active', True) is not False
+                )
+                if deposit_ok:
+                    buy_data_entry = entry.get('buy_data') or {}
+                    routes.append({
+                        'direction': 'alt_sell',
+                        'blocked_ex': sell_ex,
+                        'alt_ex': alt_ex,
+                        'buy_ex': buy_ex,
+                        'network': norm_key,
+                        'gap_pct': gap_pct,
+                        'alt_price': alt_price,
+                        'buy_price_ref': buy_price,
+                        'fee': _to_float(buy_data_entry.get('fee')),
+                        'min_withdrawal': _to_float(
+                            ((buy_data_entry.get('limits') or {}).get('withdraw') or {}).get('min')
+                        ),
+                        'blocked_reason': f"{sell_ex} deposit disabled for {norm_key}",
+                    })
+
+    if not routes:
+        return None
+
+    if symbol:
+        for route in routes:
+            profit = _route_profit(route, symbol)
+            route['profit'] = profit
+            route['net_pnl'] = profit['net_pnl'] if profit else float('-inf')
+        best = max(routes, key=lambda route: route['net_pnl'])
+        return best
+
+    return max(routes, key=lambda route: route['gap_pct'])
+
+
+def _is_confirmed_tradable(r):
+    if not r.get('meta_checked'):
+        return False
+    if r['verified'] is True:
+        return True
+    if r['verified'] is False and r.get('alt_route'):
+        return True
+    if r['verified'] is None:
+        cp = r.get('confirmed_pair')
+        if cp and cp.get('tradable_network'):
+            return True
+    return False
+
+
 def check_metadata(r):
-    """Confirms name/network/contract match for the given pair."""
     base = r['symbol'].split('/')[0]
     buy_ex, sell_ex = r['buy_ex'], r['sell_ex']
     other_exchanges = sorted(ex for ex in r['all_prices'] if ex not in (buy_ex, sell_ex))
-    r['extra_meta_summaries'] = []
+    r['extra_meta_summaries'] = [meta_summary_for(ex, base) for ex in other_exchanges]
     buy_currencies  = get_currencies(buy_ex)
     sell_currencies = get_currencies(sell_ex)
     buy_cur  = buy_currencies.get(base)
@@ -711,12 +966,12 @@ def check_metadata(r):
                     sell_venue = ensure_exchange(sell_ex)
                     ob = sell_venue.fetch_order_book(real_symbol, limit=order_book_limit_for(sell_ex), params=EXTRA_PARAMS.get(sell_ex, {}))
                     corrected_bids = _sort_book_side(ob.get('bids', []) or [], 'bids')
-                    corrected_sell_depth, _, _ = walk_book(corrected_bids, DEPTH_CHECK_USD)
+                    corrected_sell_depth, _, _ = walk_book(corrected_bids, DEPTH_CHECK_USDT)
                     if corrected_sell_depth and r.get('buy_depth_price'):
                         r['corrected_depth_gap_pct']    = ((corrected_sell_depth - r['buy_depth_price']) / r['buy_depth_price']) * 100
                         r['corrected_sell_depth_price'] = corrected_sell_depth
                 except Exception as e:
-                    log.warning(f"  WARNING  corrected depth check {real_symbol} on {sell_ex}: {str(e)[:400]}")
+                    log.warning(f"[warn] corrected depth {real_symbol} on {sell_ex}: {str(e)[:400]}")
                 sell_cur  = real_cur
                 sell_name = (real_cur.get('name') or '').strip()
                 r['sell_name'] = sell_name
@@ -822,6 +1077,11 @@ def check_metadata(r):
         r['contract_match'] = True
 
     r['alt_route'] = None
+    if not common and blocked_details and r['n_exchanges'] >= 3:
+        r['alt_route'] = evaluate_network_block(
+            base, buy_ex, sell_ex, r['buy_price'], r['sell_price'], r['all_prices'],
+            blocked_details, contract=r['contract_buy'], symbol=r['symbol']
+        )
 
     if common:
         norm_key, buy_code, buy_data, sell_code, sell_data = min(
@@ -835,7 +1095,6 @@ def check_metadata(r):
         r['withdrawal_network_norm'] = normalize_network(buy_code)
         r['withdrawal_fee']        = _to_float(buy_data.get('fee'))
         r['withdrawal_min_tokens'] = _to_float(((buy_data.get('limits') or {}).get('withdraw') or {}).get('min'))
-
 
         withdraw_secs, withdraw_desc = _extract_time_estimate(buy_data, r['withdrawal_network_norm'])
         deposit_secs,  deposit_desc  = _extract_time_estimate(sell_data, r['withdrawal_network_norm'])
@@ -874,23 +1133,217 @@ def check_metadata(r):
         r['verified'] = None
     else:
         r['verified'] = False
+
     r['confirmed_pair'] = None
+    if r['name_suspect'] and r['verified'] is not True and r['n_exchanges'] >= 3:
+        r['confirmed_pair'] = find_confirmed_pair(base, r['all_prices'])
     return r
 
 
-def get_trading_fee_rate(exchange_name, symbol):
+_FEE_CACHE = {}
+_FEE_CACHE_LOCK = threading.Lock()
+
+
+def _valid_fee(val):
+    v = _to_float(val)
+    if v is None or v != v or v < 0:
+        return None
+    return v
+
+
+def _cache_get(key, ttl):
+    with _FEE_CACHE_LOCK:
+        hit = _FEE_CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit
+    return None
+
+
+def _cache_put(key, value):
+    with _FEE_CACHE_LOCK:
+        _FEE_CACHE[key] = (time.time(), value)
+
+
+def _find_key(obj, names):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in names and not isinstance(v, (dict, list)):
+                return v
+        for v in obj.values():
+            found = _find_key(v, names)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_key(v, names)
+            if found is not None:
+                return found
+    return None
+
+
+def _bingx_spot_taker_fee(ex, symbol):
+    if not ex.markets:
+        ex.load_markets()
+    market = ex.market(symbol)
+    if not market.get('spot'):
+        raise ValueError(f"{symbol} is not a spot market")
+    method = (
+        getattr(ex, 'spotV1PrivateGetUserCommissionRate', None)
+        or getattr(ex, 'spot_v1_private_get_user_commission_rate', None)
+    )
+    if method is None:
+        raise ValueError("this ccxt version has no spot commissionRate endpoint for BingX")
+    response = method({'symbol': market['id']})
+    return _find_key(response, ('takerCommissionRate', 'taker'))
+
+
+EXCHANGE_FEE_FETCHERS = {
+    'BingX': _bingx_spot_taker_fee,
+}
+
+
+def _fetch_pair_taker_fee(exchange_name, symbol):
     ex = ensure_exchange(exchange_name)
     if ex is None:
-        return DEFAULT_TAKER_FEE
-    market = (getattr(ex, 'markets', None) or {}).get(symbol)
-    if market and market.get('taker') is not None:
-        return market['taker']
-    fees    = getattr(ex, 'fees', {}) or {}
-    trading = fees.get('trading') or {}
-    taker   = trading.get('taker')
-    if taker is not None:
-        return taker
-    return DEFAULT_TAKER_FEE
+        return None, "exchange not initialised"
+    if not getattr(ex, 'apiKey', None):
+        return None, "no API credentials (fee endpoints are private)"
+
+    has = getattr(ex, 'has', {}) or {}
+    errors = []
+
+    custom_fetcher = EXCHANGE_FEE_FETCHERS.get(exchange_name)
+    if custom_fetcher:
+        try:
+            fee = _valid_fee(custom_fetcher(ex, symbol))
+            if fee is not None:
+                return fee, None
+            errors.append(f"{exchange_name} spot fee endpoint returned no taker rate")
+        except Exception as e:
+            errors.append(f"{exchange_name} spot fee endpoint: {str(e)[:150]}")
+
+    if has.get('fetchTradingFee'):
+        try:
+            fee = _valid_fee((ex.fetch_trading_fee(symbol) or {}).get('taker'))
+            if fee is not None:
+                return fee, None
+            errors.append("fetchTradingFee returned no taker rate")
+        except Exception as e:
+            errors.append(f"fetchTradingFee: {str(e)[:150]}")
+
+    if has.get('fetchTradingFees'):
+        bulk_key = (exchange_name, '__all__')
+        bulk = _cache_get(bulk_key, FEE_CACHE_TTL_SEC)
+        try:
+            if bulk is None:
+                _cache_put(bulk_key, ex.fetch_trading_fees() or {})
+                bulk = _cache_get(bulk_key, FEE_CACHE_TTL_SEC)
+            fee = _valid_fee(((bulk[1] if bulk else {}).get(symbol) or {}).get('taker'))
+            if fee is not None:
+                return fee, None
+            errors.append("fetchTradingFees has no taker rate for this pair")
+        except Exception as e:
+            errors.append(f"fetchTradingFees: {str(e)[:150]}")
+
+    if not errors:
+        errors.append("exchange has no fee endpoint in ccxt")
+    return None, "; ".join(errors)
+
+
+def get_taker_fee(exchange_name, symbol):
+    key = (exchange_name, symbol)
+    ok = _cache_get(key, FEE_CACHE_TTL_SEC)
+    if ok is not None and ok[1] is not None:
+        return ok[1]
+    failed = _cache_get((exchange_name, symbol, 'fail'), FEE_RETRY_AFTER_FAIL_SEC)
+    if failed is not None:
+        return None
+
+    rate, reason = _fetch_pair_taker_fee(exchange_name, symbol)
+    if rate is None:
+        _cache_put((exchange_name, symbol, 'fail'), reason)
+        log.warning(f"[warn] taker fee {exchange_name} {symbol}: {reason}")
+        return None
+    fees = {'exchange': exchange_name, 'taker': rate}
+    _cache_put(key, fees)
+    return fees
+
+
+def _sort_book_side(levels, side):
+    if not levels:
+        return []
+    return sorted(levels, key=lambda lvl: lvl[0], reverse=(side == 'bids'))
+
+
+def walk_book(levels, target_usdt):
+    filled_quote = 0.0
+    filled_base  = 0.0
+    for level in levels:
+        if len(level) < 2:
+            continue
+        price, amount = level[0], level[1]
+        if price <= 0 or amount <= 0:
+            continue
+        level_quote = price * amount
+        if filled_quote + level_quote >= target_usdt:
+            remaining_quote = target_usdt - filled_quote
+            remaining_base  = remaining_quote / price
+            filled_quote += remaining_quote
+            filled_base  += remaining_base
+            return filled_quote / filled_base, filled_quote, True
+        filled_quote += level_quote
+        filled_base  += amount
+    if filled_base <= 0:
+        return None, 0.0, False
+    return filled_quote / filled_base, filled_quote, False
+
+
+def _fetch_order_book_safe(exchange_name, venue, symbol):
+    params   = EXTRA_PARAMS.get(exchange_name, {})
+    last_err = None
+    for attempt in range(1, DEPTH_FETCH_RETRIES + 1):
+        try:
+            return venue.fetch_order_book(
+                symbol, limit=order_book_limit_for(exchange_name), params=params
+            )
+        except Exception as e:
+            last_err = e
+            if attempt < DEPTH_FETCH_RETRIES:
+                time.sleep(DEPTH_FETCH_RETRY_DELAY)
+    err_summary = f"{type(last_err).__name__}: {str(last_err)[:150]}"
+    log.warning(f"[warn] order book {symbol} on {exchange_name}: {err_summary}")
+    return None
+
+
+def check_depth(r):
+    buy_ex, sell_ex, symbol = r['buy_ex'], r['sell_ex'], r['symbol']
+    buy_venue  = ensure_exchange(buy_ex)
+    sell_venue = ensure_exchange(sell_ex)
+    if buy_venue is None or sell_venue is None:
+        return r
+
+    buy_ob  = _fetch_order_book_safe(buy_ex,  buy_venue,  symbol)
+    sell_ob = _fetch_order_book_safe(sell_ex, sell_venue, symbol)
+
+    if buy_ob is None or sell_ob is None:
+        r['depth_checked'] = True
+        return r
+
+    asks = _sort_book_side(buy_ob.get('asks', []) or [], 'asks')
+    bids = _sort_book_side(sell_ob.get('bids', []) or [], 'bids')
+
+    buy_price, _, buy_ok   = walk_book(asks, DEPTH_CHECK_USDT)
+    sell_price, _, sell_ok = walk_book(bids, DEPTH_CHECK_USDT)
+
+    r['depth_checked'] = True
+    if buy_price is None or sell_price is None or buy_price <= 0:
+        r['depth_ok'] = False
+        return r
+    r['buy_depth_price']  = buy_price
+    r['sell_depth_price'] = sell_price
+    r['depth_gap_pct']    = ((sell_price - buy_price) / buy_price) * 100
+    r['depth_ok']         = buy_ok and sell_ok
+    return r
 
 
 def fmt_price(p):
@@ -905,51 +1358,58 @@ def fmt_vol(v):
     else:                return f"${v:.0f}"
 
 
-def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
+def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
                     min_withdrawal_tokens=None,
-                    buy_taker_rate=0.0, sell_taker_rate=0.0):
+                    buy_fees=None, sell_fees=None):
     if not buy_price or buy_price <= 0 or not sell_price or sell_price <= 0:
         return None
+    if not buy_fees or not sell_fees:
+        return None
 
-    buy_taker_rate       = buy_taker_rate  or 0.0
-    sell_taker_rate      = sell_taker_rate or 0.0
-    fee_tokens           = _to_float(fee_tokens)
+    buy_fee_rate  = buy_fees['taker']
+    sell_fee_rate = sell_fees['taker']
+    fee_tokens    = _to_float(fee_tokens)
     min_withdrawal_tokens = _to_float(min_withdrawal_tokens)
 
-    tokens_bought = capital_usd / buy_price
-    buy_fee_usd   = capital_usd * buy_taker_rate
-
-    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
-    tokens_remaining = tokens_bought - gas_tokens
+    tokens_bought       = capital_usdt / buy_price
+    buy_fee_tokens      = tokens_bought * buy_fee_rate
+    tokens_after_buy_fee = tokens_bought - buy_fee_tokens
 
     min_withdrawal_met = (
-        tokens_remaining >= min_withdrawal_tokens
+        tokens_after_buy_fee >= min_withdrawal_tokens
         if min_withdrawal_tokens is not None and min_withdrawal_tokens > 0
         else True
     )
 
+    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
+    tokens_remaining = tokens_after_buy_fee - gas_tokens
 
-    gross_sell_usd = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
-    sell_fee_usd   = gross_sell_usd * sell_taker_rate
-    total_received = gross_sell_usd
+    gross_sell_usdt = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
+    sell_fee_usdt   = gross_sell_usdt * sell_fee_rate
+    total_received  = gross_sell_usdt - sell_fee_usdt
 
-    total_cost = capital_usd
+    total_cost = capital_usdt
+    net_pnl    = total_received - total_cost
+    roi_pct    = (net_pnl / capital_usdt) * 100 if capital_usdt else 0.0
 
-
-    net_pnl    = total_received - total_cost - buy_fee_usd - sell_fee_usd
-    roi_pct    = (net_pnl / capital_usd) * 100 if capital_usd else 0.0
+    buy_fee_usd = buy_fee_tokens * buy_price
 
     return {
-        'capital':               capital_usd,
+        'capital':                capital_usdt,
         'tokens_bought':          tokens_bought,
+        'buy_fees':               buy_fees,
+        'buy_fee_rate':           buy_fee_rate,
+        'buy_fee_tokens':         buy_fee_tokens,
         'buy_fee_usd':            buy_fee_usd,
-        'buy_taker_rate':         buy_taker_rate,
+        'tokens_after_buy_fee':   tokens_after_buy_fee,
         'min_withdrawal_tokens':  min_withdrawal_tokens,
         'min_withdrawal_met':     min_withdrawal_met,
         'gas_tokens':             gas_tokens,
         'tokens_remaining':       tokens_remaining,
-        'sell_fee_usd':           sell_fee_usd,
-        'sell_taker_rate':        sell_taker_rate,
+        'sell_fees':              sell_fees,
+        'sell_fee_rate':          sell_fee_rate,
+        'sell_fee_usdt':          sell_fee_usdt,
+        'sell_fee_usd':           sell_fee_usdt,
         'total_cost':             total_cost,
         'total_received':         total_received,
         'net_pnl':                net_pnl,
@@ -957,30 +1417,23 @@ def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
     }
 
 
-def log_profit_block(profit):
+def log_profit_block(profit, symbol=None):
     if not profit:
+        log.info("       profit        unavailable — taker fee missing")
         return
-    log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
-    log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
-    if profit['buy_taker_rate']:
-        log.info(f"       PROFIT Buy trading fee=  -{profit['buy_fee_usd']:.4f}")
+    base = symbol.split('/')[0] if symbol else "tokens"
+    log.info(f"       capital       {profit['capital']:.0f} USDT")
+    log.info(f"       bought        {profit['tokens_bought']:.6f} {base}")
+    log.info(f"       buy fee       -{profit['buy_fee_tokens']:.6f} {base}  ({profit['buy_fee_rate']*100:.4f}% @ {profit['buy_fees']['exchange']})")
     if profit['min_withdrawal_tokens'] is not None:
-        mark = "✅" if profit['min_withdrawal_met'] else "❌"
-        note = "met" if profit['min_withdrawal_met'] else "NOT MET — trade size too small to withdraw"
-        log.info(f"       PROFIT Min withdrawal= {profit['min_withdrawal_tokens']:.6f} tokens  [{mark} {note}]")
-    log.info(f"       PROFIT Gas deducted= -{profit['gas_tokens']:.6f}")
-    log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
-    if profit['sell_taker_rate']:
-        log.info(f"       PROFIT Sell trading fee=  -{profit['sell_fee_usd']:.4f}")
-    log.info(f"       PROFIT Total cost= {profit['total_cost']:.4f} USDT")
-    log.info(f"       PROFIT Total received= {profit['total_received']:.4f} USDT")
+        mark = "ok" if profit['min_withdrawal_met'] else "TOO SMALL"
+        log.info(f"       min withdraw  {profit['min_withdrawal_tokens']:.6f} {base}  [{mark}]")
+    log.info(f"       gas           -{profit['gas_tokens']:.6f} {base}")
+    log.info(f"       remaining     {profit['tokens_remaining']:.6f} {base}")
+    log.info(f"       sell fee      -{profit['sell_fee_usdt']:.4f} USDT  ({profit['sell_fee_rate']*100:.4f}% @ {profit['sell_fees']['exchange']})")
     if profit.get('usdt_transfer_network') is not None:
-        log.info(
-            f"       PROFIT USDT transfer fee ({profit['usdt_transfer_from']} -> {profit['usdt_transfer_to']}"
-            f" via {profit['usdt_transfer_network']})=  -{profit['usdt_transfer_fee_usd']:.4f}"
-        )
-    log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
-    log.info(f"       PROFIT ROI {profit['roi_pct']:+.2f}%")
+        log.info(f"       usdt xfer     -{profit['usdt_transfer_fee_usd']:.4f} USDT  ({profit['usdt_transfer_from']} → {profit['usdt_transfer_to']} via {profit['usdt_transfer_network']})")
+    log.info(f"       net           {profit['net_pnl']:+.4f} USDT  ({profit['roi_pct']:+.2f}%)")
 
 
 TRADE_COINS_REQUIRED_FIELDS = (
@@ -990,12 +1443,6 @@ TRADE_COINS_REQUIRED_FIELDS = (
 )
 
 def save_trade_coin(r, profit):
-    """
-    Build the filtered trade_coins row from a fully-verified (r, profit)
-    pair and upsert it into Supabase (keyed on `pair`, so re-verifying the
-    same pair updates its row instead of piling up duplicates). Skips
-    saving entirely if any required field is missing.
-    """
     if not r or not profit:
         return
 
@@ -1046,95 +1493,15 @@ def save_trade_coin(r, profit):
 
     missing = [k for k in TRADE_COINS_REQUIRED_FIELDS if row.get(k) is None or row.get(k) == '']
     if missing:
-        log.info(f"       SAVE   skipped — missing: {', '.join(missing)}")
+        log.info(f"       save          skipped — missing {', '.join(missing)}")
         return
 
     try:
         sb = _get_supabase_cached()
         sb.table("trade_coins").upsert(row, on_conflict="pair").execute()
-        log.info(f"       SAVE   ✅ {pair} saved to trade_coins")
+        log.info(f"       save          {pair} → trade_coins")
     except Exception as e:
-        log.warning(f"  WARNING  saving trade_coins ({pair}): {str(e)[:150]}")
-
-
-def _sort_book_side(levels, side):
-    if not levels:
-        return []
-    return sorted(levels, key=lambda lvl: lvl[0], reverse=(side == 'bids'))
-
-
-def walk_book(levels, target_usd):
-    filled_quote = 0.0
-    filled_base  = 0.0
-    for level in levels:
-        if len(level) < 2:
-            continue
-        price, amount = level[0], level[1]
-        if price <= 0 or amount <= 0:
-            continue
-        level_quote = price * amount
-        if filled_quote + level_quote >= target_usd:
-            remaining_quote = target_usd - filled_quote
-            remaining_base  = remaining_quote / price
-            filled_quote += remaining_quote
-            filled_base  += remaining_base
-            return filled_quote / filled_base, filled_quote, True
-        filled_quote += level_quote
-        filled_base  += amount
-    if filled_base <= 0:
-        return None, 0.0, False
-    return filled_quote / filled_base, filled_quote, False
-
-
-def _fetch_order_book_safe(exchange_name, venue, symbol):
-    params   = EXTRA_PARAMS.get(exchange_name, {})
-    last_err = None
-    for attempt in range(1, DEPTH_FETCH_RETRIES + 1):
-        try:
-            return venue.fetch_order_book(
-                symbol, limit=order_book_limit_for(exchange_name), params=params
-            )
-        except Exception as e:
-            last_err = e
-            if attempt < DEPTH_FETCH_RETRIES:
-                time.sleep(DEPTH_FETCH_RETRY_DELAY)
-    err_summary = f"{type(last_err).__name__}: {str(last_err)[:150]}"
-    log.warning(
-        f"  WARNING  depth check {symbol} on {exchange_name} "
-        f"(failed all {DEPTH_FETCH_RETRIES} attempts): {err_summary}"
-    )
-    return None
-
-
-def check_depth(r):
-    buy_ex, sell_ex, symbol = r['buy_ex'], r['sell_ex'], r['symbol']
-    buy_venue  = ensure_exchange(buy_ex)
-    sell_venue = ensure_exchange(sell_ex)
-    if buy_venue is None or sell_venue is None:
-        return r
-
-    buy_ob  = _fetch_order_book_safe(buy_ex,  buy_venue,  symbol)
-    sell_ob = _fetch_order_book_safe(sell_ex, sell_venue, symbol)
-
-    if buy_ob is None or sell_ob is None:
-        r['depth_checked'] = True
-        return r
-
-    asks = _sort_book_side(buy_ob.get('asks', []) or [], 'asks')
-    bids = _sort_book_side(sell_ob.get('bids', []) or [], 'bids')
-
-    buy_price, _, buy_ok   = walk_book(asks, DEPTH_CHECK_USD)
-    sell_price, _, sell_ok = walk_book(bids, DEPTH_CHECK_USD)
-
-    r['depth_checked'] = True
-    if buy_price is None or sell_price is None or buy_price <= 0:
-        r['depth_ok'] = False
-        return r
-    r['buy_depth_price']  = buy_price
-    r['sell_depth_price'] = sell_price
-    r['depth_gap_pct']    = ((sell_price - buy_price) / buy_price) * 100
-    r['depth_ok']         = buy_ok and sell_ok
-    return r
+        log.warning(f"[warn] save trade_coins {pair}: {str(e)[:150]}")
 
 
 def fetch_arb_coins_rows():
@@ -1143,17 +1510,19 @@ def fetch_arb_coins_rows():
         rows = sb.table("arb_coins").select("*").execute()
         return rows.data or []
     except Exception as e:
-        log.warning(f"  WARNING  arb_coins fetch: {str(e)[:200]}")
+        log.warning(f"[warn] arb_coins fetch: {str(e)[:200]}")
         return []
 
 
 def delete_arb_coin(symbol):
+    """Silent delete — callers log the reason."""
     try:
         sb = _get_supabase_cached()
         sb.table("arb_coins").delete().eq("symbol", symbol).execute()
-        log.info(f"[worker1] 🗑️  removed {symbol} from arb_coins")
+        return True
     except Exception as e:
-        log.warning(f"  WARNING  arb_coins delete for {symbol}: {str(e)[:200]}")
+        log.warning(f"[warn] delete arb_coins {symbol}: {str(e)[:200]}")
+        return False
 
 
 def load_exchange_config() -> dict:
@@ -1161,7 +1530,7 @@ def load_exchange_config() -> dict:
         sb = _get_supabase_cached()
         rows = sb.table("exchange_config").select("*").execute()
     except Exception as e:
-        log.warning(f"  WARNING  exchange_config fetch: {str(e)[:200]}")
+        log.warning(f"[warn] exchange_config fetch: {str(e)[:200]}")
         return {}
     cfg = {}
     for row in rows.data or []:
@@ -1185,7 +1554,7 @@ def load_bot_state() -> dict:
         data = rows.data or []
         return data[0] if data else {}
     except Exception as e:
-        log.warning(f"  WARNING  bot_state fetch: {str(e)[:200]}")
+        log.warning(f"[warn] bot_state fetch: {str(e)[:200]}")
         return {}
 
 
@@ -1194,7 +1563,7 @@ def load_addresses() -> dict:
         sb = _get_supabase_cached()
         rows = sb.table("Addresses").select("*").execute()
     except Exception as e:
-        log.warning(f"  WARNING  Addresses fetch: {str(e)[:200]}")
+        log.warning(f"[warn] Addresses fetch: {str(e)[:200]}")
         return {}
     out = {}
     for row in rows.data or []:
@@ -1292,19 +1661,6 @@ def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, excha
 
 
 def get_usdt_network_data(exchange_name):
-    """
-    Returns {network_code: network_data} for USDT on the given exchange, combining
-    ex.fetch_currencies() with the fetch_deposit_withdraw_fee(s) fallback.
-
-    Why the merge is needed: fetch_currencies() sometimes comes back with some
-    networks missing 'fee' (or other) fields (this has been observed for Bybit in
-    particular). If we only ever look at whatever fetch_currencies() gave us, a
-    network that is actually live and cheap can silently disappear from
-    consideration just because its fee field was blank -- which is what let a
-    single, coincidentally-fee-populated network (e.g. BEP20) get treated as "the
-    cheapest" when it was really just the only one we had a fee for. Merging in
-    the dedicated fee endpoint closes that gap.
-    """
     currencies = get_currencies(exchange_name)
     usdt_cur = currencies.get('USDT') or {}
     networks = {
@@ -1333,11 +1689,6 @@ def get_usdt_network_data(exchange_name):
 
 
 def _networks_by_norm(networks_raw, enabled_key):
-    """
-    Groups a {code: data} network map by normalized network code, keeping only
-    entries where `enabled_key` ('withdraw' or 'deposit') is not explicitly False
-    and the network is not explicitly inactive.
-    """
     by_norm = defaultdict(list)
     for code, data in networks_raw.items():
         if not isinstance(data, dict):
@@ -1349,74 +1700,53 @@ def _networks_by_norm(networks_raw, enabled_key):
 
 
 def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
-    """
-    Automatic USDT network selection between the exchange currently holding USDT
-    (source) and the exchange we need to buy on (destination):
-
-      1. Read exchange_config.usdt_withdrawal_networks for the source exchange.
-      2. Call the source exchange API for its actual USDT withdrawal networks.
-      3. Keep only networks present in both (1) and (2).
-      4. Call the destination exchange API for its actual USDT deposit networks.
-      5. Intersect (3) with (4) -> networks valid for withdrawal AND deposit.
-      6. Among that intersection, pick the one with the lowest withdrawal fee
-         (per the source exchange), using the source exchange's own live fee data.
-      7. Return the selected network + fee, capped by max_withdrawal_fee_usdt.
-    """
     if holder_ex == buy_ex:
         return {'ok': True, 'network': None, 'fee_usdt': 0.0}
 
     holder_cfg = exchange_cfg.get(holder_ex.lower())
     buy_cfg    = exchange_cfg.get(buy_ex.lower())
     if not holder_cfg:
-        return {'ok': False, 'reason': f"{holder_ex} (holds USDT) has no exchange_config row"}
+        return {'ok': False, 'reason': f"{holder_ex} has no exchange_config row"}
     if not buy_cfg:
-        return {'ok': False, 'reason': f"{buy_ex} (buy side) has no exchange_config row"}
-
+        return {'ok': False, 'reason': f"{buy_ex} has no exchange_config row"}
 
     configured_source_networks = {normalize_network(n) for n in holder_cfg['usdt_withdrawal_networks']}
     configured_source_networks.discard(None)
     if not configured_source_networks:
         return {'ok': False, 'reason': f"{holder_ex} has no usdt_withdrawal_networks configured"}
 
-
     source_networks_raw = get_usdt_network_data(holder_ex)
     if not source_networks_raw:
-        return {'ok': False, 'reason': f"{holder_ex}: could not retrieve USDT network data from the exchange API"}
+        return {'ok': False, 'reason': f"{holder_ex}: no USDT network data from API"}
     source_withdraw_by_norm = _networks_by_norm(source_networks_raw, 'withdraw')
     live_source_networks = set(source_withdraw_by_norm.keys())
-
 
     valid_source_networks = configured_source_networks & live_source_networks
     if not valid_source_networks:
         return {
             'ok': False,
             'reason': (
-                f"none of {holder_ex}'s configured USDT withdrawal networks "
-                f"({sorted(n for n in configured_source_networks if n)}) are confirmed "
-                f"live/withdrawable by the {holder_ex} API "
-                f"(API reports withdrawable: {sorted(n for n in live_source_networks if n)})"
+                f"{holder_ex}: none of the configured USDT networks "
+                f"({sorted(n for n in configured_source_networks if n)}) are live"
             ),
         }
 
-
     dest_networks_raw = get_usdt_network_data(buy_ex)
     if not dest_networks_raw:
-        return {'ok': False, 'reason': f"{buy_ex}: could not retrieve USDT network data from the exchange API"}
+        return {'ok': False, 'reason': f"{buy_ex}: no USDT network data from API"}
     dest_deposit_by_norm = _networks_by_norm(dest_networks_raw, 'deposit')
     live_dest_networks = set(dest_deposit_by_norm.keys())
-
 
     common = valid_source_networks & live_dest_networks
     if not common:
         return {
             'ok': False,
             'reason': (
-                f"no common live USDT network between {holder_ex} (confirmed withdrawable: "
-                f"{sorted(n for n in valid_source_networks if n)}) and {buy_ex} (confirmed "
-                f"deposit-enabled: {sorted(n for n in live_dest_networks if n)})"
+                f"no shared USDT network between {holder_ex} "
+                f"({sorted(n for n in valid_source_networks if n)}) and {buy_ex} "
+                f"({sorted(n for n in live_dest_networks if n)})"
             ),
         }
-
 
     candidates = []
     for norm_key in common:
@@ -1429,10 +1759,7 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
     if not candidates:
         return {
             'ok': False,
-            'reason': (
-                f"{holder_ex} reports no withdrawal fee data for any of the shared live "
-                f"networks {sorted(common)}"
-            ),
+            'reason': f"{holder_ex}: no withdrawal fee data on shared networks {sorted(common)}",
         }
 
     max_fee = holder_cfg.get('max_withdrawal_fee_usdt')
@@ -1443,12 +1770,10 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
         return {
             'ok': False,
             'reason': (
-                f"cheapest of {len(candidates)} verified shared USDT network(s) on {holder_ex} "
-                f"({cheapest[1]}) costs ${cheapest[2]:.4f}, over its max_withdrawal_fee_usdt cap "
-                f"of ${max_fee}  [checked: {checked}]"
+                f"{holder_ex}: cheapest shared USDT network ({cheapest[1]}) costs "
+                f"${cheapest[2]:.4f}, over cap ${max_fee}  [checked: {checked}]"
             ),
         }
-
 
     _, network_code, fee = min(within_cap, key=lambda c: c[2])
     return {'ok': True, 'network': network_code, 'fee_usdt': fee}
@@ -1464,7 +1789,7 @@ def fetch_ticker_data(exchange_name, symbol):
         params = EXTRA_PARAMS.get(exchange_name, {})
         t = with_retries(lambda: ex.fetch_ticker(symbol, params=params), exchange_name)
     except Exception as e:
-        log.warning(f"  WARNING  {exchange_name} fetch_ticker({symbol}): {str(e)[:300]}")
+        log.warning(f"[warn] ticker {exchange_name} {symbol}: {str(e)[:300]}")
         return None
     last   = t.get('last',        0) or 0
     bid    = t.get('bid',         0) or 0
@@ -1497,7 +1822,7 @@ def fetch_tickers_grouped(needed):
             try:
                 results.update(future.result())
             except Exception as e:
-                log.warning(f"  WARNING  batched ticker fetch for {exchange_name}: {str(e)[:200]}")
+                log.warning(f"[warn] batch tickers {exchange_name}: {str(e)[:200]}")
     return results
 
 
@@ -1560,22 +1885,13 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
 
 
 def _check_transfer_time(r):
-    """
-    Returns a failure dict if the estimated coin-transfer time (buy_ex
-    withdrawal -> sell_ex deposit) exceeds MAX_TRANSFER_TIME_SEC, else None.
-    A slow transfer risks the price moving before the tokens actually arrive,
-    so pairs that exceed the limit are dropped immediately (not just
-    fail-streak-counted), since the estimate is static for a given network
-    and will keep failing.
-    """
     seconds = r.get('transfer_seconds')
     if seconds is None or seconds <= MAX_TRANSFER_TIME_SEC:
         return None
     return {
         'ok': False,
         'reason': (
-            f"estimated deposit/arrival time too slow ({r.get('transfer_time_desc')}, "
-            f"~{_fmt_duration(seconds)}) — exceeds {MAX_TRANSFER_TIME_SEC // 60}min limit"
+            f"transfer too slow (~{_fmt_duration(seconds)})"
         ),
         'r': r, 'profit': None, 'delete': True,
     }
@@ -1584,66 +1900,75 @@ def _check_transfer_time(r):
 def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
     try:
         if not buy_data or not sell_data:
-            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'no fresh prices', 'r': None, 'profit': None}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
-            return {'ok': False, 'reason': 'invalid ask/bid price data', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'invalid ask/bid', 'r': None, 'profit': None}
 
         r = _seed_result(symbol, buy_ex_name, buy_data, sell_ex_name, sell_data)
         check_depth(r)
         check_metadata(r)
 
         if r['verified'] is not True:
-            return {'ok': False, 'reason': f"transfer network no longer verified (verified={r['verified']})", 'r': r, 'profit': None}
+            return {'ok': False, 'reason': f"network not verified (verified={r['verified']})", 'r': r, 'profit': None}
 
         slow = _check_transfer_time(r)
         if slow:
             return slow
 
-        buy_fee_rate  = get_trading_fee_rate(buy_ex_name,  symbol)
-        sell_fee_rate = get_trading_fee_rate(sell_ex_name, symbol)
+        buy_fees  = get_taker_fee(buy_ex_name,  symbol)
+        sell_fees = get_taker_fee(sell_ex_name, symbol)
+        if not buy_fees or not sell_fees:
+            return {'ok': False, 'reason': 'taker fee unavailable', 'r': r, 'profit': None}
+
         profit = calc_arb_profit(
-            CAPITAL_USD, r['buy_price'], r['sell_price'],
+            CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
-            buy_taker_rate=buy_fee_rate,
-            sell_taker_rate=sell_fee_rate,
+            buy_fees=buy_fees,
+            sell_fees=sell_fees,
         )
         if not profit:
-            return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
+            return {'ok': False, 'reason': 'profit calc failed', 'r': r, 'profit': None}
 
-        ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USD
-        reason = None if ok else f"profit {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USD} threshold"
+        ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USDT
+        reason = None if ok else f"net {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USDT}"
         return {'ok': ok, 'reason': reason, 'r': r, 'profit': profit}
     except Exception as e:
-        log.warning(f"  WARNING  light verify({symbol}, {buy_ex_name}->{sell_ex_name}): {type(e).__name__}: {str(e)[:300]}")
-        return {'ok': False, 'reason': f"unexpected error: {str(e)[:150]}", 'r': None, 'profit': None}
+        log.warning(f"[warn] light verify {symbol} {buy_ex_name}→{sell_ex_name}: {type(e).__name__}: {str(e)[:300]}")
+        return {'ok': False, 'reason': f"error: {str(e)[:150]}", 'r': None, 'profit': None}
 
 
 def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                  exchange_cfg, addresses, holder_ex):
     try:
         if not buy_data or not sell_data:
-            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'no fresh prices', 'r': None, 'profit': None}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
-            return {'ok': False, 'reason': 'invalid ask/bid price data', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'invalid ask/bid', 'r': None, 'profit': None}
+
+        for ex in (buy_ex_name, sell_ex_name):
+            if ex.lower() not in exchange_cfg:
+                return {
+                    'ok': False,
+                    'reason': f"{ex} has no exchange_config row",
+                    'r': None, 'profit': None, 'delete': True,
+                }
 
         r = _seed_result(symbol, buy_ex_name, buy_data, sell_ex_name, sell_data)
         check_depth(r)
         check_metadata(r)
 
         if r['verified'] is not True:
-            return {'ok': False, 'reason': f"transfer network no longer verified (verified={r['verified']})", 'r': r, 'profit': None}
+            return {'ok': False, 'reason': f"network not verified (verified={r['verified']})", 'r': r, 'profit': None}
 
         slow = _check_transfer_time(r)
         if slow:
             return slow
 
-
         if not holder_ex:
-            return {'ok': False, 'reason': 'bot_state.holds_usdt is not set — cannot validate the USDT transfer', 'r': r, 'profit': None}
+            return {'ok': False, 'reason': 'bot_state.holds_usdt is not set', 'r': r, 'profit': None}
         usdt_plan = plan_usdt_transfer(holder_ex, buy_ex_name, exchange_cfg)
         if not usdt_plan['ok']:
-
             return {
                 'ok': False,
                 'reason': usdt_plan['reason'],
@@ -1652,7 +1977,6 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                 'delete': True,
             }
 
-
         if usdt_plan['network'] is not None:
             ok1, reason1 = validate_withdrawal_whitelist(
                 holder_ex, buy_ex_name, normalize_network(usdt_plan['network']), exchange_cfg, addresses
@@ -1660,10 +1984,9 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             if not ok1:
                 return {
                     'ok': False,
-                    'reason': f"USDT transfer ({holder_ex} -> {buy_ex_name}) whitelist check failed: {reason1}",
+                    'reason': f"USDT whitelist {holder_ex}→{buy_ex_name}: {reason1}",
                     'r': r, 'profit': None, 'delete': True,
                 }
-
 
         network_norm = r.get('withdrawal_network_norm')
         if network_norm:
@@ -1671,23 +1994,24 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             if not ok2:
                 return {
                     'ok': False,
-                    'reason': f"{symbol} transfer ({buy_ex_name} -> {sell_ex_name}) whitelist check failed: {reason2}",
+                    'reason': f"coin whitelist {buy_ex_name}→{sell_ex_name}: {reason2}",
                     'r': r, 'profit': None, 'delete': True,
                 }
 
+        buy_fees  = get_taker_fee(buy_ex_name,  symbol)
+        sell_fees = get_taker_fee(sell_ex_name, symbol)
+        if not buy_fees or not sell_fees:
+            return {'ok': False, 'reason': 'taker fee unavailable', 'r': r, 'profit': None}
 
-        buy_fee_rate  = get_trading_fee_rate(buy_ex_name,  symbol)
-        sell_fee_rate = get_trading_fee_rate(sell_ex_name, symbol)
         profit = calc_arb_profit(
-            CAPITAL_USD, r['buy_price'], r['sell_price'],
+            CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
-            buy_taker_rate=buy_fee_rate,
-            sell_taker_rate=sell_fee_rate,
+            buy_fees=buy_fees,
+            sell_fees=sell_fees,
         )
         if not profit:
-            return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
-
+            return {'ok': False, 'reason': 'profit calc failed', 'r': r, 'profit': None}
 
         if usdt_plan and usdt_plan['network'] is not None:
             profit['usdt_transfer_fee_usd'] = usdt_plan['fee_usdt']
@@ -1702,7 +2026,6 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             profit['usdt_transfer_from']    = holder_ex
             profit['usdt_transfer_to']      = buy_ex_name
 
-
         if usdt_plan['network']:
             buy_addresses = addresses.get(buy_ex_name)
             if buy_addresses:
@@ -1716,38 +2039,29 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                 if col:
                     profit['coin_dest_address'] = sell_addresses.get(col)
 
-
         if usdt_plan['network'] is not None and not profit.get('usdt_dest_address'):
             return {
                 'ok': False,
-                'reason': (
-                    f"no USDT destination address on {buy_ex_name} for network "
-                    f"{normalize_network(usdt_plan['network'])} — dropping pair"
-                ),
+                'reason': f"no USDT address on {buy_ex_name} for {normalize_network(usdt_plan['network'])}",
                 'r': r, 'profit': None, 'delete': True,
             }
         if network_norm and not profit.get('coin_dest_address'):
             base = symbol.split('/')[0]
             return {
                 'ok': False,
-                'reason': (
-                    f"no {base} deposit address on {sell_ex_name} for network "
-                    f"{network_norm} — dropping pair"
-                ),
+                'reason': f"no {base} address on {sell_ex_name} for {network_norm}",
                 'r': r, 'profit': None, 'delete': True,
             }
 
-        ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USD
-        reason = None if ok else f"profit {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USD} threshold"
+        ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USDT
+        reason = None if ok else f"net {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USDT}"
         return {'ok': ok, 'reason': reason, 'r': r, 'profit': profit, 'delete': False}
     except Exception as e:
-        log.warning(f"  WARNING  full verify({symbol}, {buy_ex_name}->{sell_ex_name}): {type(e).__name__}: {str(e)[:300]}")
-        return {'ok': False, 'reason': f"unexpected error: {str(e)[:150]}", 'r': None, 'profit': None}
+        log.warning(f"[warn] full verify {symbol} {buy_ex_name}→{sell_ex_name}: {type(e).__name__}: {str(e)[:300]}")
+        return {'ok': False, 'reason': f"error: {str(e)[:150]}", 'r': None, 'profit': None}
 
 
 def reverify_pair(symbol, buy_ex_name, sell_ex_name):
-    """Worker2: one‑off full verification using the trader pool."""
-
     old_mode = get_exchange_mode()
     set_exchange_mode('trader')
     try:
@@ -1763,66 +2077,40 @@ def reverify_pair(symbol, buy_ex_name, sell_ex_name):
 
 
 def print_pair_report_full(r, profit):
-    log.info(f"{r['symbol']}  |  gap {r['gap_pct']:.2f}%  |  {r['n_exchanges']} exchanges")
-    log.info(f"       BUY   {r['buy_ex']:<10}  ask {fmt_price(r['buy_price'])}  vol {fmt_vol(r['buy_vol'])}  24h {r['buy_chg']:+.1f}%")
-    log.info(f"       SELL  {r['sell_ex']:<10}  bid {fmt_price(r['sell_price'])}  vol {fmt_vol(r['sell_vol'])}  24h {r['sell_chg']:+.1f}%")
-    prices = "  ".join(f"{ex}:{fmt_price(p['price'])}" for ex, p in sorted(r['all_prices'].items()))
-    log.info(f"       ALL   {prices}")
-    if r['depth_checked']:
-        if r['buy_depth_price'] is None:
-            log.info(f"       DEPTH  insufficient liquidity to verify — SKIP")
-        else:
-            status = "OK" if r['depth_ok'] else f"THIN (book ran out before ${DEPTH_CHECK_USD} filled)"
-            log.info(
-                f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
-                f"sell avg {fmt_price(r['sell_depth_price'])}  "
-                f"real gap {r['depth_gap_pct']:.2f}%  [{status}]"
-            )
-    else:
-        log.info(f"       DEPTH  not checked (exchange unavailable)")
+    log.info(f"{r['symbol']}   {r['buy_ex']} → {r['sell_ex']}   gap {r['gap_pct']:+.2f}%")
+    log.info(f"       buy           {fmt_price(r['buy_price'])}  (ask)")
+    log.info(f"       sell          {fmt_price(r['sell_price'])}  (bid)")
+    if r['depth_checked'] and r['buy_depth_price'] is not None:
+        depth_mark = "" if r['depth_ok'] else "  [thin]"
+        log.info(f"       depth         buy {fmt_price(r['buy_depth_price'])}  sell {fmt_price(r['sell_depth_price'])}  real gap {r['depth_gap_pct']:+.2f}%{depth_mark}")
+
+    if r['corrected_symbol']:
+        log.info(f"       NOTE          ticker collision — '{r['buy_name']}' trades as {r['corrected_symbol']} on {r['sell_ex']}  (corrected gap {r['corrected_gap_pct']:.2f}%)")
 
     if r['verified'] is True:
-        basis = "contract address match" if r['contract_match'] is True else f"name '{r['buy_name']}' on both"
-        min_wd = r['withdrawal_min_tokens']
-        log.info(
-            f"       VERIFY  ✅ confirmed via {basis}  |  "
-            f"network {r['withdrawal_network']}  fee {r['withdrawal_fee']}  "
-            f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
-        )
+        basis = "contract" if r['contract_match'] is True else "name"
+        log.info(f"       verify        ok  ({basis} match · {r['withdrawal_network']} · fee {r['withdrawal_fee']} · min {r['withdrawal_min_tokens']})")
         if r.get('transfer_seconds') is not None:
-            mark = "✅" if r['transfer_seconds'] <= MAX_TRANSFER_TIME_SEC else "❌"
-            log.info(
-                f"       ARRIVAL {mark} est. {_fmt_duration(r['transfer_seconds'])}  "
-                f"({r['transfer_time_desc']})"
-            )
-        else:
-            log.info(f"       ARRIVAL  unknown (exchange returned no confirmation/arrival data)")
-
+            log.info(f"       arrival       ~{_fmt_duration(r['transfer_seconds'])}")
         if profit and profit.get('usdt_transfer_from'):
             if profit.get('usdt_transfer_network') is None:
-                log.info(f"       USDT   already on {profit['usdt_transfer_from']} — no transfer needed")
+                log.info(f"       usdt          already on {profit['usdt_transfer_from']}")
             else:
-                dest_addr = profit.get('usdt_dest_address', 'N/A')
-                log.info(
-                    f"       USDT   {profit['usdt_transfer_from']} -> {profit['usdt_transfer_to']} "
-                    f"via {profit['usdt_transfer_network']}  fee ${profit['usdt_transfer_fee_usd']:.4f}"
-                )
-                log.info(f"               destination address: {dest_addr}")
-
+                log.info(f"       usdt xfer     {profit['usdt_transfer_from']} → {profit['usdt_transfer_to']}  via {profit['usdt_transfer_network']}  -${profit['usdt_transfer_fee_usd']:.4f}  → {profit.get('usdt_dest_address','N/A')}")
         if profit and profit.get('coin_dest_address'):
-            log.info(f"       COIN   deposit address on {r['sell_ex']}: {profit['coin_dest_address']}")
-
+            log.info(f"       coin dest     {profit['coin_dest_address']}  ({r['sell_ex']})")
         if profit:
-            log_profit_block(profit)
-
+            log_profit_block(profit, r['symbol'])
         save_trade_coin(r, profit)
+    elif r['verified'] is False and r.get('alt_route'):
+        ar = r['alt_route']
+        log.info(f"       verify        alt route  ({ar['blocked_reason']})")
+        if ar['direction'] == 'alt_buy':
+            log.info(f"       tradable      {ar['alt_ex']} → {r['sell_ex']}  via {ar['network']}  gap {ar['gap_pct']:+.2f}%")
+        else:
+            log.info(f"       tradable      {r['buy_ex']} → {ar['alt_ex']}  via {ar['network']}  gap {ar['gap_pct']:+.2f}%")
     else:
-        log.info(f"       VERIFY  ❌ transfer network no longer valid (verified={r['verified']})")
-
-    if r['buy_meta_summary']:
-        log.info(f"       META   {r['buy_meta_summary']}")
-    if r['sell_meta_summary']:
-        log.info(f"       META   {r['sell_meta_summary']}")
+        log.info(f"       verify        failed  (verified={r['verified']})")
     log.info("")
 
 
@@ -1861,19 +2149,19 @@ fail_streaks = defaultdict(int)
 
 
 def worker1_loop():
-    log.info(f"[worker1] started — scanning arb_coins every {WORKER1_INTERVAL_SEC}s (scanner mode)")
+    log.info(f"[worker1] scanning every {WORKER1_INTERVAL_SEC}s")
     set_exchange_mode('scanner')
     while True:
         try:
             rows = fetch_arb_coins_rows()
             if not rows:
-                log.info("[worker1] arb_coins table is empty — nothing to scan")
+                log.info("[worker1] arb_coins empty — idle")
                 time.sleep(WORKER1_INTERVAL_SEC)
                 continue
 
-
             exchange_cfg = load_exchange_config()
             rows_to_keep = []
+            dropped = 0
             for row in rows:
                 symbol = row.get('symbol')
                 buy_ex = row.get('buy_exchange')
@@ -1881,20 +2169,32 @@ def worker1_loop():
                 if not (symbol and buy_ex and sell_ex):
                     continue
 
-                buy_cfg = exchange_cfg.get(buy_ex.lower(), {})
-                sell_cfg = exchange_cfg.get(sell_ex.lower(), {})
+                buy_cfg  = exchange_cfg.get(buy_ex.lower())
+                sell_cfg = exchange_cfg.get(sell_ex.lower())
+
+                if buy_cfg is None or sell_cfg is None:
+                    missing = buy_ex if buy_cfg is None else sell_ex
+                    log.info(f"[worker1] drop {symbol:<16} {missing} not configured")
+                    delete_arb_coin(symbol)
+                    active_trade.clear_if_matches(symbol)
+                    fail_streaks.pop(symbol, None)
+                    dropped += 1
+                    continue
+
                 if buy_cfg.get('is_disabled') or sell_cfg.get('is_disabled'):
                     disabled = buy_ex if buy_cfg.get('is_disabled') else sell_ex
-                    log.info(f"[worker1] 🗑️  {symbol}: {disabled} is disabled in exchange_config — removing")
+                    log.info(f"[worker1] drop {symbol:<16} {disabled} disabled")
                     delete_arb_coin(symbol)
                     active_trade.clear_if_matches(symbol)
                     fail_streaks.pop(symbol, None)
+                    dropped += 1
                     continue
                 if sell_cfg.get('buy_only'):
-                    log.info(f"[worker1] 🗑️  {symbol}: {sell_ex} is buy-only but used as sell side — removing")
+                    log.info(f"[worker1] drop {symbol:<16} {sell_ex} is buy-only")
                     delete_arb_coin(symbol)
                     active_trade.clear_if_matches(symbol)
                     fail_streaks.pop(symbol, None)
+                    dropped += 1
                     continue
                 rows_to_keep.append(row)
 
@@ -1902,14 +2202,12 @@ def worker1_loop():
                 time.sleep(WORKER1_INTERVAL_SEC)
                 continue
 
-
             needed = defaultdict(set)
             for row in rows_to_keep:
                 symbol, buy_ex, sell_ex = row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange')
                 needed[buy_ex].add(symbol)
                 needed[sell_ex].add(symbol)
             ticker_map = fetch_tickers_grouped(needed)
-
 
             outcomes = []
             with ThreadPoolExecutor(max_workers=min(len(rows_to_keep), ROW_PROCESS_MAX_WORKERS)) as pool:
@@ -1926,12 +2224,12 @@ def worker1_loop():
                     try:
                         result = future.result()
                     except Exception as e:
-                        log.error(f"[worker1] row processing error for {row.get('symbol')}: {e}")
+                        log.error(f"[worker1] row error {row.get('symbol')}: {e}")
                         result = None
                     if result:
                         outcomes.append((row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange'), result))
 
-
+            picked = 0
             for symbol, buy_ex, sell_ex, check in outcomes:
                 if check['ok']:
                     fail_streaks.pop(symbol, None)
@@ -1944,36 +2242,33 @@ def worker1_loop():
                     }
                     assigned, previous = active_trade.try_assign(candidate)
                     if assigned:
-                        prev_desc = (
-                            f"(replacing {previous['symbol']} @ ${previous['profit_usdt']:+.4f})"
-                            if previous and previous['symbol'] != symbol else
-                            "" if previous else "(worker2 was idle)"
-                        )
-                        log.info(f"[worker1] ✅ {symbol}: profit ${profit_usdt:+.4f} — handed to worker2 {prev_desc}".rstrip())
-                    else:
-                        log.info(f"[worker1]    {symbol}: profit ${profit_usdt:+.4f} — not better than worker2's current pick")
+                        log.info(f"[worker1] pick {symbol:<16} ${profit_usdt:+.4f}  → worker2")
+                        picked += 1
                 elif check.get('delete'):
-                    log.info(f"[worker1] 🗑️  {symbol}: {check['reason']} — removing immediately")
+                    log.info(f"[worker1] drop {symbol:<16} {check['reason']}")
                     delete_arb_coin(symbol)
                     fail_streaks.pop(symbol, None)
                     active_trade.clear_if_matches(symbol)
+                    dropped += 1
                 else:
                     fail_streaks[symbol] += 1
                     streak = fail_streaks[symbol]
-                    log.info(f"[worker1] ⚠️  {symbol}: {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
                     if streak >= FAIL_STREAK_LIMIT:
+                        log.info(f"[worker1] drop {symbol:<16} {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
                         delete_arb_coin(symbol)
                         fail_streaks.pop(symbol, None)
                         active_trade.clear_if_matches(symbol)
+                        dropped += 1
+
+            log.info(f"[worker1] scan done — {len(rows_to_keep)} checked, {picked} picked, {dropped} dropped")
 
         except Exception as e:
-            log.error(f"[worker1] unexpected error: {e}")
+            log.error(f"[worker1] error: {e}")
         time.sleep(WORKER1_INTERVAL_SEC)
 
 
 def worker2_loop():
-    log.info("[worker2] started — waits idle, runs once each time worker1 hands off a new pair (trader mode)")
-
+    log.info("[worker2] idle — waiting for pick")
     set_exchange_mode('trader')
     while True:
         try:
@@ -1981,12 +2276,12 @@ def worker2_loop():
             active = active_trade.get()
             if not active:
                 continue
-            log.info(f"[worker2] now watching {active['symbol']} ({active['buy_ex']} -> {active['sell_ex']})")
+            log.info(f"[worker2] verify {active['symbol']}  {active['buy_ex']} → {active['sell_ex']}")
             check = reverify_pair(active['symbol'], active['buy_ex'], active['sell_ex'])
             if not check['ok']:
-                log.info(f"[worker2] {active['symbol']}: {check['reason']}")
+                log.info(f"[worker2] reject {active['symbol']}  {check['reason']}")
                 if check.get('delete'):
-                    log.info(f"[worker2] 🗑️  {active['symbol']}: removing from arb_coins (confirmed whitelist rejection)")
+                    log.info(f"[worker2] drop {active['symbol']}  whitelist rejection")
                     delete_arb_coin(active['symbol'])
                     fail_streaks.pop(active['symbol'], None)
                     active_trade.clear_if_matches(active['symbol'])
@@ -1995,15 +2290,19 @@ def worker2_loop():
             print_pair_report_full(check['r'], check['profit'])
 
         except Exception as e:
-            log.error(f"[worker2] unexpected error: {e}")
+            log.error(f"[worker2] error: {e}")
 
 
 def main():
-    log.info("trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)")
-    log.info(f"worker1 interval: {WORKER1_INTERVAL_SEC}s  |  worker2: event-driven")
-    log.info(f"Min qualifying profit: ${MIN_STORE_PROFIT_USD}  |  fail-streak limit: {FAIL_STREAK_LIMIT}")
-    log.info("Scanner mode: uses general API keys, proxies only Bybit via arb-bot")
-    log.info("Trader mode: uses restricted API keys, proxies ALL exchanges via trade-proxy")
+    log.info("arb analyzer")
+    log.info(f"  scan interval     {WORKER1_INTERVAL_SEC}s")
+    log.info(f"  min profit        {MIN_STORE_PROFIT_USDT} USDT")
+    log.info(f"  capital           {CAPITAL_USDT} USDT")
+    log.info(f"  depth check       {DEPTH_CHECK_USDT} USDT")
+    log.info(f"  fail limit        {FAIL_STREAK_LIMIT}")
+    log.info(f"  scanner proxies   {', '.join(sorted(PROXY_EXCHANGES_SCAN))}")
+    log.info(f"  trader proxies    {', '.join(sorted(PROXY_EXCHANGES_TRADE))}")
+    log.info(f"  taker fees        live per pair")
     log.info("")
 
     t1 = threading.Thread(target=worker1_loop, name="worker1", daemon=True)
@@ -2015,7 +2314,7 @@ def main():
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        log.info("trader.py stopped.")
+        log.info("stopped.")
 
 
 if __name__ == "__main__":
