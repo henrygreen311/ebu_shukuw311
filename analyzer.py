@@ -479,11 +479,6 @@ _TIME_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Only explicit, human-readable arrival-time fields are trusted. Anything
-# involving confirmation counts is deliberately excluded — those multiply
-# against a block-time table that is wrong for many networks (especially
-# new chains like Robinhood, where the API reports thousands of "confirmations"
-# that don't translate to the user-visible arrival estimate at all).
 _TIME_KEYS = (
     'estimatedArrivalTime', 'estimated_arrival_time', 'arrivalTime', 'arrival_time',
     'estimateArrivalTime', 'estimatedTime', 'estimated_time',
@@ -496,7 +491,6 @@ def _parse_time_text_to_seconds(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        # Numeric fields in this context are minutes, not seconds.
         return float(value) * 60 if value > 0 else None
     text = str(value).strip()
     if not text:
@@ -519,12 +513,6 @@ def _find_first_key(d, keys):
 
 
 def _extract_time_estimate(network_data, network_norm):
-    """
-    Returns (seconds, description) only when the exchange provides an
-    explicit arrival-time field. Never guesses from confirmation counts.
-    Returns (None, None) when nothing reliable is available — callers must
-    treat that as "unknown", not as "too slow".
-    """
     if not isinstance(network_data, dict):
         return None, None
     info = network_data.get('info')
@@ -1875,11 +1863,6 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
 
 
 def _check_transfer_time(r):
-    """
-    Only reject when we have an EXPLICIT arrival estimate that exceeds the
-    limit. When the estimate is unknown (None), we accept the pair — the
-    exchange didn't tell us, so we can't claim it's slow.
-    """
     seconds = r.get('transfer_seconds')
     if seconds is None:
         return None
@@ -2228,6 +2211,7 @@ def worker1_loop():
 
             picked = 0
             for symbol, buy_ex, sell_ex, check in outcomes:
+                route = f"{buy_ex}→{sell_ex}"
                 if check['ok']:
                     fail_streaks.pop(symbol, None)
                     profit_usdt = check['profit']['net_pnl']
@@ -2239,10 +2223,12 @@ def worker1_loop():
                     }
                     assigned, previous = active_trade.try_assign(candidate)
                     if assigned:
-                        log.info(f"[worker1] pick {symbol:<16} ${profit_usdt:+.4f}  → worker2")
+                        log.info(f"[worker1] pick {symbol:<16} {route:<20} ${profit_usdt:+.4f}  → worker2")
                         picked += 1
+                    else:
+                        log.info(f"[worker1] hold {symbol:<16} {route:<20} ${profit_usdt:+.4f}  (worse than current pick)")
                 elif check.get('delete'):
-                    log.info(f"[worker1] drop {symbol:<16} {check['reason']}")
+                    log.info(f"[worker1] drop {symbol:<16} {route:<20} {check['reason']}")
                     delete_arb_coin(symbol)
                     fail_streaks.pop(symbol, None)
                     active_trade.clear_if_matches(symbol)
@@ -2251,11 +2237,13 @@ def worker1_loop():
                     fail_streaks[symbol] += 1
                     streak = fail_streaks[symbol]
                     if streak >= FAIL_STREAK_LIMIT:
-                        log.info(f"[worker1] drop {symbol:<16} {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
+                        log.info(f"[worker1] drop {symbol:<16} {route:<20} {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
                         delete_arb_coin(symbol)
                         fail_streaks.pop(symbol, None)
                         active_trade.clear_if_matches(symbol)
                         dropped += 1
+                    else:
+                        log.info(f"[worker1] skip {symbol:<16} {route:<20} {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
 
             log.info(f"[worker1] scan done — {len(rows_to_keep)} checked, {picked} picked, {dropped} dropped")
 
