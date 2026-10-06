@@ -1396,22 +1396,38 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
 
 
 def log_profit_block(profit, symbol=None):
+    """Matches tracker.py's PROFIT block exactly, with an extra USDT-transfer line."""
     if not profit:
-        log.info("       profit        unavailable — taker fee missing")
+        log.info("       PROFIT not calculated (taker fee unavailable — see warning above)")
         return
-    base = symbol.split('/')[0] if symbol else "tokens"
-    log.info(f"       capital       {profit['capital']:.0f} USDT")
-    log.info(f"       bought        {profit['tokens_bought']:.6f} {base}")
-    log.info(f"       buy fee       -{profit['buy_fee_tokens']:.6f} {base}  ({profit['buy_fee_rate']*100:.4f}% @ {profit['buy_fees']['exchange']})")
+    base = symbol.split("/")[0] if symbol else "tokens"
+    log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
+    log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
+    log.info(
+        f"       PROFIT Buy taker fee ({profit['buy_fee_rate'] * 100:.4f}% "
+        f"@ {profit['buy_fees']['exchange']})=  -{profit['buy_fee_tokens']:.6f} {base}"
+    )
+    log.info(f"       PROFIT Tokens after buy fee= {profit['tokens_after_buy_fee']:.6f}")
     if profit['min_withdrawal_tokens'] is not None:
-        mark = "ok" if profit['min_withdrawal_met'] else "TOO SMALL"
-        log.info(f"       min withdraw  {profit['min_withdrawal_tokens']:.6f} {base}  [{mark}]")
-    log.info(f"       gas           -{profit['gas_tokens']:.6f} {base}")
-    log.info(f"       remaining     {profit['tokens_remaining']:.6f} {base}")
-    log.info(f"       sell fee      -{profit['sell_fee_usdt']:.4f} USDT  ({profit['sell_fee_rate']*100:.4f}% @ {profit['sell_fees']['exchange']})")
+        mark = "✅" if profit['min_withdrawal_met'] else "❌"
+        note = "met" if profit['min_withdrawal_met'] else "NOT MET — trade size too small to withdraw"
+        log.info(f"       PROFIT Min withdrawal= {profit['min_withdrawal_tokens']:.6f} tokens  [{mark} {note}]")
+    log.info(f"       PROFIT withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
+    log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
+    log.info(
+        f"       PROFIT Sell taker fee ({profit['sell_fee_rate'] * 100:.4f}% "
+        f"@ {profit['sell_fees']['exchange']})=  -{profit['sell_fee_usdt']:.4f} USDT"
+    )
+    log.info(f"       PROFIT Total cost= {profit['total_cost']:.4f} USDT")
+    log.info(f"       PROFIT Total received= {profit['total_received']:.4f} USDT")
     if profit.get('usdt_transfer_network') is not None:
-        log.info(f"       usdt xfer     -{profit['usdt_transfer_fee_usd']:.4f} USDT  ({profit['usdt_transfer_from']} → {profit['usdt_transfer_to']} via {profit['usdt_transfer_network']})")
-    log.info(f"       net           {profit['net_pnl']:+.4f} USDT  ({profit['roi_pct']:+.2f}%)")
+        log.info(
+            f"       PROFIT USDT transfer fee "
+            f"({profit['usdt_transfer_from']} → {profit['usdt_transfer_to']} "
+            f"via {profit['usdt_transfer_network']})=  -{profit['usdt_transfer_fee_usd']:.4f}"
+        )
+    log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
+    log.info(f"       PROFIT ROI {profit['roi_pct']:+.2f}%")
 
 
 TRADE_COINS_REQUIRED_FIELDS = (
@@ -1493,7 +1509,6 @@ def fetch_arb_coins_rows():
 
 
 def delete_arb_coin(symbol):
-    """Silent delete — callers log the reason."""
     try:
         sb = _get_supabase_cached()
         sb.table("arb_coins").delete().eq("symbol", symbol).execute()
@@ -2056,41 +2071,93 @@ def reverify_pair(symbol, buy_ex_name, sell_ex_name):
 
 def print_pair_report_full(r, profit):
     log.info(f"{r['symbol']}   {r['buy_ex']} → {r['sell_ex']}   gap {r['gap_pct']:+.2f}%")
-    log.info(f"       buy           {fmt_price(r['buy_price'])}  (ask)")
-    log.info(f"       sell          {fmt_price(r['sell_price'])}  (bid)")
-    if r['depth_checked'] and r['buy_depth_price'] is not None:
-        depth_mark = "" if r['depth_ok'] else "  [thin]"
-        log.info(f"       depth         buy {fmt_price(r['buy_depth_price'])}  sell {fmt_price(r['sell_depth_price'])}  real gap {r['depth_gap_pct']:+.2f}%{depth_mark}")
+    log.info(f"       BUY   {r['buy_ex']:<10}  ask {fmt_price(r['buy_price'])}  vol {fmt_vol(r['buy_vol'])}  24h {r['buy_chg']:+.1f}%")
+    log.info(f"       SELL  {r['sell_ex']:<10}  bid {fmt_price(r['sell_price'])}  vol {fmt_vol(r['sell_vol'])}  24h {r['sell_chg']:+.1f}%")
+    if r['depth_checked']:
+        if r['buy_depth_price'] is None:
+            log.info(f"       DEPTH insufficient liquidity to verify — SKIP")
+        else:
+            status = "OK" if r['depth_ok'] else f"THIN (book ran out before {DEPTH_CHECK_USDT} USDT filled)"
+            log.info(
+                f"       DEPTH buy avg {fmt_price(r['buy_depth_price'])}  "
+                f"sell avg {fmt_price(r['sell_depth_price'])}  "
+                f"real gap {r['depth_gap_pct']:.2f}%  [{status}]"
+            )
+    else:
+        log.info(f"       DEPTH not checked (exchange unavailable)")
 
     if r['corrected_symbol']:
-        log.info(f"       NOTE          ticker collision — '{r['buy_name']}' trades as {r['corrected_symbol']} on {r['sell_ex']}  (corrected gap {r['corrected_gap_pct']:.2f}%)")
+        depth_note = (
+            f"  |  depth-adjusted: {r['corrected_depth_gap_pct']:.2f}%"
+            if r['corrected_depth_gap_pct'] is not None else ""
+        )
+        log.info(
+            f"       NOTE   Ticker collision resolved by name — '{r['buy_name']}' "
+            f"actually trades as {r['corrected_symbol']} on {r['sell_ex']}. "
+            f"Re-priced sell: {fmt_price(r['corrected_sell_price'])}  "
+            f"corrected gap: {r['corrected_gap_pct']:.2f}%{depth_note}"
+        )
 
     if r['verified'] is True:
-        basis = "contract" if r['contract_match'] is True else "name"
-        log.info(f"       verify        ok  ({basis} match · {r['withdrawal_network']} · fee {r['withdrawal_fee']} · min {r['withdrawal_min_tokens']})")
+        basis = "contract address match" if r['contract_match'] is True else f"name '{r['buy_name']}' on both"
+        min_wd = r['withdrawal_min_tokens']
+        log.info(
+            f"       VERIFY  ✅ confirmed via {basis}  |  "
+            f"network {r['withdrawal_network']}  fee {r['withdrawal_fee']}  "
+            f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
+        )
         if r.get('transfer_seconds') is not None:
-            log.info(f"       arrival       ~{_fmt_duration(r['transfer_seconds'])}")
+            mark = "✅" if r['transfer_seconds'] <= MAX_TRANSFER_TIME_SEC else "❌"
+            log.info(
+                f"       ARRIVAL {mark} est. {_fmt_duration(r['transfer_seconds'])}  "
+                f"({r['transfer_time_desc']})"
+            )
         else:
-            log.info(f"       arrival       unknown  (exchange returned no explicit time)")
+            log.info(f"       ARRIVAL unknown (exchange returned no explicit time)")
+
         if profit and profit.get('usdt_transfer_from'):
             if profit.get('usdt_transfer_network') is None:
-                log.info(f"       usdt          already on {profit['usdt_transfer_from']}")
+                log.info(f"       USDT   already on {profit['usdt_transfer_from']} — no transfer needed")
             else:
-                log.info(f"       usdt xfer     {profit['usdt_transfer_from']} → {profit['usdt_transfer_to']}  via {profit['usdt_transfer_network']}  -${profit['usdt_transfer_fee_usd']:.4f}  → {profit.get('usdt_dest_address','N/A')}")
+                dest_addr = profit.get('usdt_dest_address', 'N/A')
+                log.info(
+                    f"       USDT   {profit['usdt_transfer_from']} -> {profit['usdt_transfer_to']} "
+                    f"via {profit['usdt_transfer_network']}  fee ${profit['usdt_transfer_fee_usd']:.4f}"
+                )
+                log.info(f"              destination address: {dest_addr}")
+
         if profit and profit.get('coin_dest_address'):
-            log.info(f"       coin dest     {profit['coin_dest_address']}  ({r['sell_ex']})")
+            log.info(f"       COIN   deposit address on {r['sell_ex']}: {profit['coin_dest_address']}")
+
         if profit:
             log_profit_block(profit, r['symbol'])
+
         save_trade_coin(r, profit)
     elif r['verified'] is False and r.get('alt_route'):
         ar = r['alt_route']
-        log.info(f"       verify        alt route  ({ar['blocked_reason']})")
+        log.info(f"       VERIFY  ✅ Same token existed on {r['n_exchanges']} exchanges.")
+        log.info(f"       VERIFY  ❌ {ar['blocked_reason']}")
         if ar['direction'] == 'alt_buy':
-            log.info(f"       tradable      {ar['alt_ex']} → {r['sell_ex']}  via {ar['network']}  gap {ar['gap_pct']:+.2f}%")
+            log.info(
+                f"       VERIFY  ✅ {ar['alt_ex']} withdraw allowed in {ar['network']}  |  "
+                f"ask {fmt_price(ar['alt_price'])}  |  gap {ar['gap_pct']:.2f}%"
+            )
+            log.info(f"       VERIFY  📉 Tradable at {ar['alt_ex']} → {r['sell_ex']} | {ar['network']} 🚀")
         else:
-            log.info(f"       tradable      {r['buy_ex']} → {ar['alt_ex']}  via {ar['network']}  gap {ar['gap_pct']:+.2f}%")
+            log.info(
+                f"       VERIFY  ✅ {ar['alt_ex']} deposit allowed in {ar['network']}  |  "
+                f"bid {fmt_price(ar['alt_price'])}  |  gap {ar['gap_pct']:.2f}%"
+            )
+            log.info(f"       VERIFY  📉 Tradable at {r['buy_ex']} → {ar['alt_ex']} | {ar['network']} 🚀")
     else:
-        log.info(f"       verify        failed  (verified={r['verified']})")
+        log.info(f"       VERIFY  ❌ transfer network no longer valid (verified={r['verified']})")
+
+    if r['buy_meta_summary']:
+        log.info(f"       META   {r['buy_meta_summary']}")
+    if r['sell_meta_summary']:
+        log.info(f"       META   {r['sell_meta_summary']}")
+    for extra_summary in r.get('extra_meta_summaries') or []:
+        log.info(f"       META   {extra_summary}")
     log.info("")
 
 
