@@ -1496,14 +1496,31 @@ def save_trade_coin(r, profit):
         arrival_time = f"est. {_fmt_duration(transfer_secs)}"
 
     usdt_holder  = profit.get('usdt_transfer_from')
+    usdt_to      = profit.get('usdt_transfer_to')
     usdt_network = profit.get('usdt_transfer_network')
     usdt_fee     = profit.get('usdt_transfer_fee_usd')
-    usdt_transfer_fee = (
-        f"{usdt_network}/{usdt_fee:.4f}"
-        if usdt_network and usdt_fee is not None else None
+
+    # When the USDT is already on the buy exchange, no transfer happens.
+    # The row still needs non-empty markers here so it can be saved; the
+    # trader executes the "same-exchange" path via its own .lower() check
+    # and does not rely on these values.
+    same_exchange = bool(
+        usdt_holder and usdt_to and
+        usdt_holder.strip().lower() == usdt_to.strip().lower()
     )
 
+    if same_exchange:
+        usdt_transfer_fee = "same-exchange/0.0000"
+    else:
+        usdt_transfer_fee = (
+            f"{usdt_network}/{usdt_fee:.4f}"
+            if usdt_network and usdt_fee is not None else None
+        )
+
     usdt_d_address = profit.get('usdt_dest_address')
+    if same_exchange and not usdt_d_address:
+        usdt_d_address = "same-exchange"
+
     coin_d_address = profit.get('coin_dest_address')
 
     buy_fee  = profit.get('buy_fee_usd')
@@ -1755,7 +1772,17 @@ def _networks_by_norm(networks_raw, enabled_key):
     return by_norm
 
 def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
-    if holder_ex == buy_ex:
+    # ------------------------------------------------------------------
+    # FIX: case-insensitive comparison. bot_state.holds_usdt may store
+    # 'Mexc' / 'MEXC' / 'mexc' interchangeably, and the pair's buy_ex
+    # comes from a different source. A raw == would treat 'Mexc' and
+    # 'MEXC' as different exchanges, plan a USDT transfer, apply a fee,
+    # set usdt_transfer_network='PLASMA', and print a misleading
+    # "Mexc -> MEXC via PLASMA" line — even though trader.py's
+    # execute_trade() (which compares with .lower()) correctly skips
+    # the transfer because it's the same exchange.
+    # ------------------------------------------------------------------
+    if (holder_ex or "").strip().lower() == (buy_ex or "").strip().lower():
         return {'ok': True, 'network': None, 'fee_usdt': 0.0}
 
     holder_cfg = exchange_cfg.get(holder_ex.lower())
@@ -2255,20 +2282,6 @@ class ActiveTrade:
         self._changed = threading.Event()
 
     def process_round(self, fresh_results):
-        """
-        fresh_results: list of (symbol, buy_ex, sell_ex, profit_usdt) tuples
-        for every pair that passed verification in this scan round.
-
-        Decision:
-          - If the currently active symbol re-verified this round, use its
-            FRESH profit as the comparison bar (this is the bug fix).
-          - If the active symbol did not re-verify (failed / removed), clear
-            it — we can't claim it's a valid pick.
-          - Pick the best of fresh_results.
-              * Same symbol as active  → update in place, do NOT wake worker2.
-              * Different symbol       → replace, wake worker2.
-              * Active was None        → assign best, wake worker2.
-        """
         with self._lock:
             fresh_by_symbol = {r[0]: r for r in fresh_results}
 
