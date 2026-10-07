@@ -2,6 +2,7 @@ import ccxt
 import re
 import time
 import json
+import random
 import logging
 import threading
 import requests
@@ -37,8 +38,11 @@ _proxy_session = requests.Session()
 TIMEOUT_MS = 10_000
 PROXY_TIMEOUT_MS = 20_000
 
-RETRY_ATTEMPTS = 1
-RETRY_DELAY = 1
+RETRY_ATTEMPTS = 2
+RETRY_DELAY = 2
+
+PROXY_RETRY_ATTEMPTS = 3
+PROXY_RETRY_BASE_DELAY = 1.0
 
 CAPITAL_USDT     = 1000
 DEPTH_CHECK_USDT = 1000
@@ -65,12 +69,12 @@ ORDER_BOOK_LIMIT_OVERRIDES = {
 def order_book_limit_for(exchange_name):
     return ORDER_BOOK_LIMIT_OVERRIDES.get(exchange_name, ORDER_BOOK_LIMIT)
 
-DEPTH_FETCH_RETRIES     = 3
-DEPTH_FETCH_RETRY_DELAY = 1
+DEPTH_FETCH_RETRIES     = 2
+DEPTH_FETCH_RETRY_DELAY = 2
 
 WORKER1_INTERVAL_SEC = 5 * 60
 FAIL_STREAK_LIMIT     = 3
-ROW_PROCESS_MAX_WORKERS = 20
+ROW_PROCESS_MAX_WORKERS = 8
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +85,10 @@ log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+def _sleep_with_jitter(base_delay, attempt):
+    delay = base_delay * attempt + random.uniform(0, base_delay * 0.5)
+    time.sleep(delay)
+
 def with_retries(fn, label):
     last_err = None
     for attempt in range(RETRY_ATTEMPTS + 1):
@@ -89,7 +97,7 @@ def with_retries(fn, label):
         except Exception as e:
             last_err = e
             if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
+                _sleep_with_jitter(RETRY_DELAY, attempt + 1)
     raise last_err
 
 def _load_db_config() -> dict:
@@ -201,26 +209,44 @@ def route_through_proxy(ex, mode):
         if parsed.query:
             new_url += f"?{parsed.query}"
 
-        def do_request():
-            resp = _proxy_session.request(
-                method,
-                new_url,
-                headers=request_headers,
-                cookies=proxy_cookies,
-                data=body if method != 'GET' else None,
-                timeout=20,
-            )
+        last_err = None
+        for attempt in range(1, PROXY_RETRY_ATTEMPTS + 1):
+            try:
+                resp = _proxy_session.request(
+                    method,
+                    new_url,
+                    headers=request_headers,
+                    cookies=proxy_cookies,
+                    data=body if method != 'GET' else None,
+                    timeout=20,
+                )
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_err = e
+                if attempt < PROXY_RETRY_ATTEMPTS:
+                    _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
+                    continue
+                raise
+
+            if resp.status_code >= 500:
+                last_err = Exception(
+                    f"{exchange_key} {method} {new_url} -> "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+                if attempt < PROXY_RETRY_ATTEMPTS:
+                    _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
+                    continue
+                raise last_err
+
             if resp.status_code >= 400:
-                raise Exception(f"{exchange_key} {method} {new_url} -> {resp.status_code}: {resp.text[:300]}")
+                raise Exception(
+                    f"{exchange_key} {method} {new_url} -> "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+
             try:
                 return json.loads(resp.text)
             except ValueError:
                 return resp.text
-
-        try:
-            return do_request()
-        except Exception:
-            return do_request()
 
     ex.fetch = proxied_fetch
     if exchange_key == 'bybit':
@@ -1306,7 +1332,7 @@ def _fetch_order_book_safe(exchange_name, venue, symbol):
         except Exception as e:
             last_err = e
             if attempt < DEPTH_FETCH_RETRIES:
-                time.sleep(DEPTH_FETCH_RETRY_DELAY)
+                _sleep_with_jitter(DEPTH_FETCH_RETRY_DELAY, attempt)
     err_summary = f"{type(last_err).__name__}: {str(last_err)[:150]}"
     log.warning(
         f"  WARNING  depth check {symbol} on {exchange_name} "
@@ -2246,8 +2272,6 @@ class ActiveTrade:
         with self._lock:
             fresh_by_symbol = {r[0]: r for r in fresh_results}
 
-            # If the active symbol did not re-verify this round, drop it so
-            # its stale profit can't block a fresh pair from taking over.
             if self._active and self._active['symbol'] not in fresh_by_symbol:
                 self._active = None
 
@@ -2272,7 +2296,6 @@ class ActiveTrade:
 
             cur = self._active
             if cur['symbol'] == best_sym:
-                # Same symbol, fresh number. Update in place, don't wake worker2.
                 cur['buy_ex']      = best_bex
                 cur['sell_ex']     = best_sex
                 cur['profit_usdt'] = best_prof
@@ -2389,8 +2412,6 @@ def worker1_loop():
                     if result:
                         outcomes.append((row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange'), result))
 
-            # Collect fresh candidates, handle failures, then decide the
-            # round winner atomically.
             fresh_results = []
             for symbol, buy_ex, sell_ex, check in outcomes:
                 if check['ok']:
