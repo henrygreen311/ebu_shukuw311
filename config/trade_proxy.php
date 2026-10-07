@@ -33,6 +33,8 @@ $known = [
     'mexc'   => 'api.mexc.com',
     'bingx'  => 'open-api.bingx.com',
     'okx'    => 'www.okx.com',
+    'lbank'  => 'api.lbkex.com',
+    'gate'   => 'api.gateio.ws',
 ];
 if ($targetHost === '' && isset($known[$exchange])) {
     $targetHost = $known[$exchange];
@@ -48,18 +50,19 @@ $query = $_SERVER['QUERY_STRING'] ?? '';
 $url = 'https://' . $targetHost . $exchangePath;
 if ($query) $url .= '?' . $query;
 
-$forward = [
-    'accept', 'authorization', 'user-agent', 'content-type',
-    'x-bapi-api-key', 'x-bapi-sign', 'x-bapi-timestamp', 'x-bapi-recv-window',
-    'kc-api-key', 'kc-api-sign', 'kc-api-timestamp',
-    'kc-api-passphrase', 'kc-api-key-version',
-    'ok-access-key', 'ok-access-sign', 'ok-access-timestamp', 'ok-access-passphrase',
+$blocked = [
+    'host',
+    'content-length',
+    'connection',
+    'x-proxy-target-host',
+    'x-proxy-exchange',
 ];
 $headers = [];
 foreach (getallheaders() as $k => $v) {
-    if (in_array(strtolower($k), $forward)) {
-        $headers[] = "$k: $v";
+    if (in_array(strtolower($k), $blocked, true)) {
+        continue;
     }
+    $headers[] = "$k: $v";
 }
 $headers[] = 'Expect:';
 

@@ -1581,23 +1581,12 @@ def load_addresses() -> dict:
             'universal':           str(row.get('universal')).strip().lower() == 'true',
             'whitelisted_network': row.get('whitelisted_network') or [],
             'ETH': row.get('ETH'),
-            'BEP20': row.get('BEP20'),
-            'TRC20': row.get('TRC20'),
-            'POLYGON': row.get('POLYGON'),
-            'ARBITRUM': row.get('ARBITRUM'),
-            'OPTIMISM': row.get('OPTIMISM'),
-            'SOLANA': row.get('SOLANA'),
-            'AVAX': row.get('AVAX'),
-            'BTC': row.get('BTC'),
-            'BASE': row.get('BASE'),
+            'BSC': row.get('BSC'),
+            'SOL': row.get('SOL'),
             'TON': row.get('TON'),
             'APTOS': row.get('APTOS'),
-            'SUI': row.get('SUI'),
-            'XRP': row.get('XRP'),
-            'DOGE': row.get('DOGE'),
-            'LTC': row.get('LTC'),
             'PLASMA': row.get('PLASMA'),
-            'CELO': row.get('CELO'),
+            'ROBINHOOD': row.get('ROBINHOOD'),
         }
     return out
 
@@ -1605,12 +1594,12 @@ EVM_NETWORKS = {'ETH', 'BSC', 'MATIC', 'ARB', 'OP', 'BASE', 'CELO', 'PLASMA'}
 
 ADDRESS_COLUMN_FOR_NETWORK = {
     'ETH':    'ETH',
-    'BSC':    'BEP20',
+    'BSC':    'BSC',
     'TRX':    'TRC20',
     'MATIC':  'POLYGON',
     'ARB':    'ARBITRUM',
     'OP':     'OPTIMISM',
-    'SOL':    'SOLANA',
+    'SOL':    'SOL',
     'AVAX':   'AVAX',
     'BTC':    'BTC',
     'BASE':   'BASE',
@@ -1622,6 +1611,7 @@ ADDRESS_COLUMN_FOR_NETWORK = {
     'LTC':    'LTC',
     'PLASMA': 'PLASMA',
     'CELO':   'CELO',
+    'ROBINHOOD': 'ROBINHOOD',
 }
 
 def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
@@ -1634,33 +1624,72 @@ def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
     whitelisted_norm = {normalize_network(n) for n in row['whitelisted_network']}
     return norm in whitelisted_norm
 
+def _resolve_destination_column(sender_row, destination_row, network_norm):
+    if destination_row is None:
+        return None
+    sender_evm = bool((sender_row or {}).get('evm', False))
+    if sender_evm and network_norm in EVM_NETWORKS:
+        return 'ETH'
+    return ADDRESS_COLUMN_FOR_NETWORK.get(network_norm)
+
 def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, exchange_cfg, addresses):
     sender_cfg = exchange_cfg.get(sender_ex.lower()) or {}
     if not sender_cfg.get('requires_withdrawal_whitelist'):
         return True, f"{sender_ex} does not require a withdrawal whitelist"
 
+    sender_row = addresses.get(sender_ex)
+    if not sender_row:
+        return False, f"{sender_ex} has no row in the Addresses table (required because whitelist is on)"
+
     dest_row = addresses.get(destination_ex)
     if not dest_row:
         return False, f"{destination_ex} has no row in the Addresses table"
 
-    column = ADDRESS_COLUMN_FOR_NETWORK.get(network_norm)
-    if not column:
-        return False, f"no Addresses column mapped for network '{network_norm}'"
-    dest_address = dest_row.get(column)
-    if not dest_address:
-        return False, f"{destination_ex} has no address for network {network_norm} (column {column})"
-
-    sender_row = addresses.get(sender_ex)
-    if not sender_row:
-        return False, f"{sender_ex} has no row in the Addresses table (required because whitelist is on)"
-    evm = sender_row.get('evm', False)
-    universal = sender_row.get('universal', False)
+    is_evm_network   = network_norm in EVM_NETWORKS
+    sender_evm       = bool(sender_row.get('evm', False))
+    sender_universal = bool(sender_row.get('universal', False))
     whitelisted_norm = {normalize_network(n) for n in (sender_row.get('whitelisted_network') or [])}
-    if evm and universal and network_norm in EVM_NETWORKS:
-        return True, f"{sender_ex} has universal EVM whitelist, {network_norm} accepted"
-    if network_norm in whitelisted_norm:
-        return True, f"{network_norm} is explicitly whitelisted on {sender_ex}"
-    return False, f"{network_norm} is not whitelisted on {sender_ex}"
+
+    if sender_evm and is_evm_network:
+        dest_col = 'ETH'
+        if not dest_row.get(dest_col):
+            return False, (
+                f"{sender_ex} treats {network_norm} as EVM-compatible but "
+                f"{destination_ex} has no {dest_col} address"
+            )
+        return True, (
+            f"{sender_ex} EVM compatibility accepts {network_norm} "
+            f"(destination uses {dest_col})"
+        )
+
+    if sender_universal:
+        if network_norm not in whitelisted_norm:
+            return False, f"{network_norm} is not whitelisted on {sender_ex}"
+        dest_col = ADDRESS_COLUMN_FOR_NETWORK.get(network_norm)
+        if not dest_col:
+            return False, f"no Addresses column mapped for network '{network_norm}'"
+        if not dest_row.get(dest_col):
+            return False, (
+                f"{destination_ex} has no {dest_col} address for network {network_norm}"
+            )
+        return True, (
+            f"{network_norm} is whitelisted on {sender_ex} "
+            f"(destination uses {dest_col})"
+        )
+
+    if network_norm not in whitelisted_norm:
+        return False, f"{network_norm} is not whitelisted on {sender_ex}"
+    dest_col = ADDRESS_COLUMN_FOR_NETWORK.get(network_norm)
+    if not dest_col:
+        return False, f"no Addresses column mapped for network '{network_norm}'"
+    if not dest_row.get(dest_col):
+        return False, (
+            f"{destination_ex} has no {dest_col} address for network {network_norm}"
+        )
+    return True, (
+        f"{network_norm} is whitelisted on {sender_ex} "
+        f"(strict, destination uses {dest_col})"
+    )
 
 def get_usdt_network_data(exchange_name):
     currencies = get_currencies(exchange_name)
@@ -2029,15 +2058,19 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             profit['usdt_transfer_to']      = buy_ex_name
 
         if usdt_plan['network']:
-            buy_addresses = addresses.get(buy_ex_name)
+            buy_addresses   = addresses.get(buy_ex_name)
+            sender_row_usdt = addresses.get(holder_ex)
             if buy_addresses:
-                col = ADDRESS_COLUMN_FOR_NETWORK.get(normalize_network(usdt_plan['network']))
+                usdt_net_norm = normalize_network(usdt_plan['network'])
+                col = _resolve_destination_column(sender_row_usdt, buy_addresses, usdt_net_norm)
                 if col:
                     profit['usdt_dest_address'] = buy_addresses.get(col)
+
         if network_norm:
-            sell_addresses = addresses.get(sell_ex_name)
+            sell_addresses  = addresses.get(sell_ex_name)
+            sender_row_coin = addresses.get(buy_ex_name)
             if sell_addresses:
-                col = ADDRESS_COLUMN_FOR_NETWORK.get(network_norm)
+                col = _resolve_destination_column(sender_row_coin, sell_addresses, network_norm)
                 if col:
                     profit['coin_dest_address'] = sell_addresses.get(col)
 
