@@ -2156,11 +2156,7 @@ def print_pair_report_full(r, profit):
         )
         if r.get('transfer_seconds') is not None:
             if r.get('transfer_time_estimated'):
-                log.info(
-                    f"       ARRIVAL  ⚠️  time unknown — assumed worst-case "
-                    f"{_fmt_duration(r['transfer_seconds'])} (within {MAX_TRANSFER_TIME_SEC // 60}min limit)  "
-                    f"({r['transfer_time_desc']})"
-                )
+                log.info(f"       ARRIVAL  ⚠️  time unknown — default to 15mins")
             else:
                 mark = "✅" if r['transfer_seconds'] <= MAX_TRANSFER_TIME_SEC else "❌"
                 log.info(
@@ -2176,7 +2172,7 @@ def print_pair_report_full(r, profit):
             else:
                 dest_addr = profit.get('usdt_dest_address', 'N/A')
                 log.info(
-                    f"       USDT   {profit['usdt_transfer_from']} -> {profit['usdt_transfer_to']} "
+                    f"       USDT HOLDER :  {profit['usdt_transfer_from']} -> {profit['usdt_transfer_to']} "
                     f"via {profit['usdt_transfer_network']}  fee ${profit['usdt_transfer_fee_usd']:.4f}"
                 )
                 log.info(f"               destination address: {dest_addr}")
