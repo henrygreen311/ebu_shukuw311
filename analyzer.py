@@ -2212,19 +2212,88 @@ def print_pair_report_full(r, profit):
     log.info("")
 
 class ActiveTrade:
+    """
+    Holder for the pair worker2 should be verifying.
+
+    Invariant (after process_round returns): _active is the highest-profit
+    pair that verified in the most recent worker1 scan, or None if no pair
+    verified. Stale profits from previous rounds are never used as the
+    comparison bar — the fresh value of the currently active symbol (if it
+    re-verified this round) replaces the stored one before the winner is
+    chosen.
+    """
+
     def __init__(self):
         self._lock = threading.Lock()
         self._active = None
         self._changed = threading.Event()
 
-    def try_assign(self, candidate):
+    def process_round(self, fresh_results):
+        """
+        fresh_results: list of (symbol, buy_ex, sell_ex, profit_usdt) tuples
+        for every pair that passed verification in this scan round.
+
+        Decision:
+          - If the currently active symbol re-verified this round, use its
+            FRESH profit as the comparison bar (this is the bug fix).
+          - If the active symbol did not re-verify (failed / removed), clear
+            it — we can't claim it's a valid pick.
+          - Pick the best of fresh_results.
+              * Same symbol as active  → update in place, do NOT wake worker2.
+              * Different symbol       → replace, wake worker2.
+              * Active was None        → assign best, wake worker2.
+        """
         with self._lock:
-            current = self._active
-            if current is None or candidate['profit_usdt'] > current['profit_usdt']:
-                self._active = candidate
+            fresh_by_symbol = {r[0]: r for r in fresh_results}
+
+            # If the active symbol did not re-verify this round, drop it so
+            # its stale profit can't block a fresh pair from taking over.
+            if self._active and self._active['symbol'] not in fresh_by_symbol:
+                self._active = None
+
+            if not fresh_results:
+                return
+
+            best_sym, best_bex, best_sex, best_prof = max(fresh_results, key=lambda r: r[3])
+
+            if self._active is None:
+                self._active = {
+                    'symbol':      best_sym,
+                    'buy_ex':      best_bex,
+                    'sell_ex':     best_sex,
+                    'profit_usdt': best_prof,
+                }
                 self._changed.set()
-                return True, current
-            return False, current
+                log.info(
+                    f"[worker1] ✅ {best_sym}: profit ${best_prof:+.4f} — "
+                    f"handed to worker2 (worker2 was idle)"
+                )
+                return
+
+            cur = self._active
+            if cur['symbol'] == best_sym:
+                # Same symbol, fresh number. Update in place, don't wake worker2.
+                cur['buy_ex']      = best_bex
+                cur['sell_ex']     = best_sex
+                cur['profit_usdt'] = best_prof
+                log.info(
+                    f"[worker1]    {best_sym}: profit ${best_prof:+.4f} — "
+                    f"still best (worker2 unchanged)"
+                )
+            else:
+                old_sym  = cur['symbol']
+                old_prof = cur['profit_usdt']
+                self._active = {
+                    'symbol':      best_sym,
+                    'buy_ex':      best_bex,
+                    'sell_ex':     best_sex,
+                    'profit_usdt': best_prof,
+                }
+                self._changed.set()
+                log.info(
+                    f"[worker1] ✅ {best_sym}: profit ${best_prof:+.4f} — "
+                    f"replacing {old_sym} (was ${old_prof:+.4f})"
+                )
 
     def get(self):
         with self._lock:
@@ -2320,26 +2389,15 @@ def worker1_loop():
                     if result:
                         outcomes.append((row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange'), result))
 
+            # Collect fresh candidates, handle failures, then decide the
+            # round winner atomically.
+            fresh_results = []
             for symbol, buy_ex, sell_ex, check in outcomes:
                 if check['ok']:
                     fail_streaks.pop(symbol, None)
-                    profit_usdt = check['profit']['net_pnl']
-                    candidate = {
-                        'symbol': symbol,
-                        'buy_ex': buy_ex,
-                        'sell_ex': sell_ex,
-                        'profit_usdt': profit_usdt,
-                    }
-                    assigned, previous = active_trade.try_assign(candidate)
-                    if assigned:
-                        prev_desc = (
-                            f"(replacing {previous['symbol']} @ ${previous['profit_usdt']:+.4f})"
-                            if previous and previous['symbol'] != symbol else
-                            "" if previous else "(worker2 was idle)"
-                        )
-                        log.info(f"[worker1] ✅ {symbol}: profit ${profit_usdt:+.4f} — handed to worker2 {prev_desc}".rstrip())
-                    else:
-                        log.info(f"[worker1]    {symbol}: profit ${profit_usdt:+.4f} — not better than worker2's current pick")
+                    fresh_results.append(
+                        (symbol, buy_ex, sell_ex, check['profit']['net_pnl'])
+                    )
                 elif check.get('delete'):
                     log.info(f"[worker1] 🗑️  {symbol}: {check['reason']} — removing immediately")
                     delete_arb_coin(symbol)
@@ -2353,6 +2411,8 @@ def worker1_loop():
                         delete_arb_coin(symbol)
                         fail_streaks.pop(symbol, None)
                         active_trade.clear_if_matches(symbol)
+
+            active_trade.process_round(fresh_results)
 
         except Exception as e:
             log.error(f"[worker1] unexpected error: {e}")
