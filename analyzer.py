@@ -44,6 +44,8 @@ RETRY_DELAY = 2
 PROXY_RETRY_ATTEMPTS = 3
 PROXY_RETRY_BASE_DELAY = 1.0
 
+EXCHANGE_FAIL_BACKOFF_SEC = 600
+
 CAPITAL_USDT     = 1000
 DEPTH_CHECK_USDT = 1000
 MIN_STORE_PROFIT_USDT = 0.1
@@ -85,6 +87,15 @@ log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Exceptions that indicate a permanent condition — never worth retrying.
+_PERMANENT_ERRORS = (
+    ccxt.BadSymbol,
+    ccxt.AuthenticationError,
+    ccxt.PermissionDenied,
+    ccxt.InvalidAddress,
+    ccxt.NotSupported,
+)
+
 def _sleep_with_jitter(base_delay, attempt):
     delay = base_delay * attempt + random.uniform(0, base_delay * 0.5)
     time.sleep(delay)
@@ -94,6 +105,8 @@ def with_retries(fn, label):
     for attempt in range(RETRY_ATTEMPTS + 1):
         try:
             return fn()
+        except _PERMANENT_ERRORS:
+            raise
         except Exception as e:
             last_err = e
             if attempt < RETRY_ATTEMPTS:
@@ -297,29 +310,41 @@ def build_exchange(name, mode):
                 log.warning(f"  WARNING  KuCoin set_markets bootstrap failed: {str(e)[:300]}")
 
     if not proxied:
+        # For directly-reached exchanges, if load_markets fails we cannot
+        # use the exchange this round. Raise so ensure_exchange marks it
+        # failed and backs off instead of hitting the same 429 on every
+        # single fetch_ticker call within a scan.
         try:
             ex.load_markets()
             if not ex.markets:
-                log.warning(f"  WARNING  {name}: load_markets() returned 0 markets")
+                raise Exception("load_markets() returned 0 markets")
         except Exception as e:
-            log.warning(f"  WARNING  {name}: load_markets() failed — {str(e)[:400]}")
+            raise Exception(f"{name}: load_markets failed — {str(e)[:250]}")
 
     return ex
 
 EXCHANGES_CACHE = {'scanner': {}, 'trader': {}}
+EXCHANGE_FAILURES = {'scanner': {}, 'trader': {}}
 
 def ensure_exchange(name):
     mode = get_exchange_mode()
     cache = EXCHANGES_CACHE[mode]
     if name in cache and cache[name] is not None:
         return cache[name]
+
+    last_fail = EXCHANGE_FAILURES[mode].get(name)
+    if last_fail is not None and (time.time() - last_fail) < EXCHANGE_FAIL_BACKOFF_SEC:
+        return None
+
     try:
         ex = with_retries(lambda: build_exchange(name, mode), f"{name} ({mode})")
     except Exception as e:
         log.warning(f"  WARNING  {name} ({mode}): could not initialize — {str(e)[:400]}")
         cache[name] = None
+        EXCHANGE_FAILURES[mode][name] = time.time()
         return None
     cache[name] = ex
+    EXCHANGE_FAILURES[mode].pop(name, None)
     return ex
 
 def _clean_networks_dict(networks):
@@ -1500,10 +1525,6 @@ def save_trade_coin(r, profit):
     usdt_network = profit.get('usdt_transfer_network')
     usdt_fee     = profit.get('usdt_transfer_fee_usd')
 
-    # When the USDT is already on the buy exchange, no transfer happens.
-    # The row still needs non-empty markers here so it can be saved; the
-    # trader executes the "same-exchange" path via its own .lower() check
-    # and does not rely on these values.
     same_exchange = bool(
         usdt_holder and usdt_to and
         usdt_holder.strip().lower() == usdt_to.strip().lower()
@@ -1572,7 +1593,7 @@ def delete_arb_coin(symbol):
     try:
         sb = _get_supabase_cached()
         sb.table("arb_coins").delete().eq("symbol", symbol).execute()
-        log.info(f"[worker1] 🗑️  removed {symbol} from arb_coins")
+        log.info(f"🗑️  removed {symbol} from arb_coins")
     except Exception as e:
         log.warning(f"  WARNING  arb_coins delete for {symbol}: {str(e)[:200]}")
 
@@ -1772,16 +1793,6 @@ def _networks_by_norm(networks_raw, enabled_key):
     return by_norm
 
 def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
-    # ------------------------------------------------------------------
-    # FIX: case-insensitive comparison. bot_state.holds_usdt may store
-    # 'Mexc' / 'MEXC' / 'mexc' interchangeably, and the pair's buy_ex
-    # comes from a different source. A raw == would treat 'Mexc' and
-    # 'MEXC' as different exchanges, plan a USDT transfer, apply a fee,
-    # set usdt_transfer_network='PLASMA', and print a misleading
-    # "Mexc -> MEXC via PLASMA" line — even though trader.py's
-    # execute_trade() (which compares with .lower()) correctly skips
-    # the transfer because it's the same exchange.
-    # ------------------------------------------------------------------
     if (holder_ex or "").strip().lower() == (buy_ex or "").strip().lower():
         return {'ok': True, 'network': None, 'fee_usdt': 0.0}
 
@@ -1875,6 +1886,9 @@ def fetch_ticker_data(exchange_name, symbol):
     try:
         params = EXTRA_PARAMS.get(exchange_name, {})
         t = with_retries(lambda: ex.fetch_ticker(symbol, params=params), exchange_name)
+    except ccxt.BadSymbol as e:
+        log.warning(f"  WARNING  {exchange_name} fetch_ticker({symbol}): symbol not listed — {str(e)[:120]}")
+        return {'bad_symbol': True}
     except Exception as e:
         log.warning(f"  WARNING  {exchange_name} fetch_ticker({symbol}): {str(e)[:300]}")
         return None
@@ -1885,6 +1899,11 @@ def fetch_ticker_data(exchange_name, symbol):
     change = t.get('percentage',  0) or 0
     if bid <= 0: bid = last
     if ask <= 0: ask = last
+    # If the exchange handed us a ticker that has no price at all (rate-limited
+    # or empty response), don't fabricate a 0-price quote — return None so the
+    # caller reports "could not fetch fresh prices" instead of "invalid ask/bid".
+    if last <= 0 and bid <= 0 and ask <= 0:
+        return None
     return {'price': last, 'bid': bid, 'ask': ask, 'volume': volume, 'change': change}
 
 def fetch_tickers_grouped(needed):
@@ -1984,6 +2003,14 @@ def _check_transfer_time(r):
 
 def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
     try:
+        # Permanent: one side doesn't list the symbol. Delete immediately, don't streak.
+        if (buy_data and buy_data.get('bad_symbol')) or (sell_data and sell_data.get('bad_symbol')):
+            missing_side = buy_ex_name if (buy_data and buy_data.get('bad_symbol')) else sell_ex_name
+            return {
+                'ok': False,
+                'reason': f"{missing_side} does not list {symbol}",
+                'r': None, 'profit': None, 'delete': True,
+            }
         if not buy_data or not sell_data:
             return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
@@ -2025,6 +2052,13 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
 def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                  exchange_cfg, addresses, holder_ex):
     try:
+        if (buy_data and buy_data.get('bad_symbol')) or (sell_data and sell_data.get('bad_symbol')):
+            missing_side = buy_ex_name if (buy_data and buy_data.get('bad_symbol')) else sell_ex_name
+            return {
+                'ok': False,
+                'reason': f"{missing_side} does not list {symbol}",
+                'r': None, 'profit': None, 'delete': True,
+            }
         if not buy_data or not sell_data:
             return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
