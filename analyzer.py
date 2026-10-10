@@ -87,7 +87,6 @@ log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# Exceptions that indicate a permanent condition — never worth retrying.
 _PERMANENT_ERRORS = (
     ccxt.BadSymbol,
     ccxt.AuthenticationError,
@@ -222,6 +221,13 @@ def route_through_proxy(ex, mode):
         if parsed.query:
             new_url += f"?{parsed.query}"
 
+        # Short label for error messages — exchange API path only, no proxy
+        # hostname. This keeps every log line free of the InfinityFree URL.
+        short_path = parsed.path or "/"
+        if parsed.query:
+            short_path += f"?{parsed.query}"
+        short_label = f"{exchange_key} {method} {short_path}"
+
         last_err = None
         for attempt in range(1, PROXY_RETRY_ATTEMPTS + 1):
             try:
@@ -234,17 +240,15 @@ def route_through_proxy(ex, mode):
                     timeout=20,
                 )
             except (requests.ConnectionError, requests.Timeout) as e:
-                last_err = e
+                reason = "connection refused" if "refused" in str(e).lower() else type(e).__name__
+                last_err = Exception(f"{short_label} -> {reason}")
                 if attempt < PROXY_RETRY_ATTEMPTS:
                     _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
                     continue
-                raise
+                raise last_err
 
             if resp.status_code >= 500:
-                last_err = Exception(
-                    f"{exchange_key} {method} {new_url} -> "
-                    f"{resp.status_code}: {resp.text[:200]}"
-                )
+                last_err = Exception(f"{short_label} -> HTTP {resp.status_code}")
                 if attempt < PROXY_RETRY_ATTEMPTS:
                     _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
                     continue
@@ -252,8 +256,7 @@ def route_through_proxy(ex, mode):
 
             if resp.status_code >= 400:
                 raise Exception(
-                    f"{exchange_key} {method} {new_url} -> "
-                    f"{resp.status_code}: {resp.text[:200]}"
+                    f"{short_label} -> HTTP {resp.status_code}: {resp.text[:200]}"
                 )
 
             try:
@@ -310,10 +313,6 @@ def build_exchange(name, mode):
                 log.warning(f"  WARNING  KuCoin set_markets bootstrap failed: {str(e)[:300]}")
 
     if not proxied:
-        # For directly-reached exchanges, if load_markets fails we cannot
-        # use the exchange this round. Raise so ensure_exchange marks it
-        # failed and backs off instead of hitting the same 429 on every
-        # single fetch_ticker call within a scan.
         try:
             ex.load_markets()
             if not ex.markets:
@@ -1479,7 +1478,7 @@ def log_profit_block(profit, symbol=None):
         mark = "✅" if profit['min_withdrawal_met'] else "❌"
         note = "met" if profit['min_withdrawal_met'] else "NOT MET — trade size too small to withdraw"
         log.info(f"       PROFIT Min withdrawal= {profit['min_withdrawal_tokens']:.6f} tokens  [{mark} {note}]")
-    log.info(f"       PROFIT Gas deducted= -{profit['gas_tokens']:.6f}")
+    log.info(f"       PROFIT Withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
     log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
     log.info(
         f"       PROFIT Sell taker fee ({profit['sell_fee_rate'] * 100:.4f}% "
@@ -1899,9 +1898,6 @@ def fetch_ticker_data(exchange_name, symbol):
     change = t.get('percentage',  0) or 0
     if bid <= 0: bid = last
     if ask <= 0: ask = last
-    # If the exchange handed us a ticker that has no price at all (rate-limited
-    # or empty response), don't fabricate a 0-price quote — return None so the
-    # caller reports "could not fetch fresh prices" instead of "invalid ask/bid".
     if last <= 0 and bid <= 0 and ask <= 0:
         return None
     return {'price': last, 'bid': bid, 'ask': ask, 'volume': volume, 'change': change}
@@ -2003,7 +1999,6 @@ def _check_transfer_time(r):
 
 def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
     try:
-        # Permanent: one side doesn't list the symbol. Delete immediately, don't streak.
         if (buy_data and buy_data.get('bad_symbol')) or (sell_data and sell_data.get('bad_symbol')):
             missing_side = buy_ex_name if (buy_data and buy_data.get('bad_symbol')) else sell_ex_name
             return {
@@ -2299,17 +2294,6 @@ def print_pair_report_full(r, profit):
     log.info("")
 
 class ActiveTrade:
-    """
-    Holder for the pair worker2 should be verifying.
-
-    Invariant (after process_round returns): _active is the highest-profit
-    pair that verified in the most recent worker1 scan, or None if no pair
-    verified. Stale profits from previous rounds are never used as the
-    comparison bar — the fresh value of the currently active symbol (if it
-    re-verified this round) replaces the stored one before the winner is
-    chosen.
-    """
-
     def __init__(self):
         self._lock = threading.Lock()
         self._active = None
