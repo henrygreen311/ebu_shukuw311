@@ -34,8 +34,8 @@ ALT_ROUTE_MIN_GAP_PERCENT = MIN_GAP_PERCENT
 MAX_PRICE_RATIO = 3.0
 MIN_CONFIRMED_PAIR_GAP = 3.0
 
-CAPITAL_USDT = 20
-DEPTH_CHECK_USDT = 20
+CAPITAL_USDT = 1000
+DEPTH_CHECK_USDT = 1000
 MIN_STORE_PROFIT_USDT = 0.1
 
 FEE_CACHE_TTL_SEC = 60 * 60
@@ -630,6 +630,9 @@ NETWORK_ALIASES = {
     "DOGE": "DOGE", "DOGECOIN": "DOGE",
     "LTC": "LTC", "LITECOIN": "LTC",
     "ZKSYNC": "ZKSYNC", "ZKSYNCERA": "ZKSYNC",
+    "ROBINHOOD": "ROBINHOOD", "ROBINHOODCHAIN": "ROBINHOOD",
+    "PLASMA": "PLASMA",
+    "CELO": "CELO",
 }
 
 _NETWORK_PAREN_RE = re.compile(r'\(([^)]+)\)\s*$')
@@ -729,87 +732,157 @@ def _to_float(val):
     except (TypeError, ValueError):
         return None
 
-
-# ----------------------------------------------------------------------
-#  Raw-info fee extraction (Gate etc.)
-#
-#  Gate's /spot/currencies response carries the fee data in currency-level
-#  maps instead of inside the per-chain objects ccxt reads from:
-#
-#      "chains": [{ "name": "BEP20", "withdraw_fix": "0", ... }]
-#      "withdraw_fix_on_chains":          { "BEP20": "7564525.4" }
-#      "withdraw_percent_on_chains":      { "BEP20": "2%" }
-#      "withdraw_amount_min_on_chains":   { "BEP20": "10000000" }
-#
-#  ccxt 4.5.39's gate parser only reads chains[].withdraw_fix, so the map
-#  values are lost — fee/min come back None. These helpers pull the real
-#  values out of info directly.
-# ----------------------------------------------------------------------
-def _raw_lookup_in_info(info, network_code, *map_keys):
-    """Look up network_code in any of the given map keys inside info."""
-    if not isinstance(info, dict):
-        return None
-
-    for key in map_keys:
-        mapping = info.get(key)
-        if isinstance(mapping, dict):
-            val = mapping.get(network_code)
-            if val is not None and val != "":
-                return val
-
-    chains = info.get("chains")
-    if isinstance(chains, list):
-        for chain in chains:
-            if not isinstance(chain, dict):
-                continue
-            if chain.get("name") != network_code:
-                continue
-            for key in map_keys:
-                val = chain.get(key)
-                if val is not None and val != "":
-                    return val
-    return None
+_GATE_WITHDRAW_INFO_CACHE = {}
+_GATE_WITHDRAW_INFO_LOCK = threading.Lock()
+_GATE_WITHDRAW_INFO_TTL = 1800
 
 
-def _raw_network_fee_min(currency_info, network_code):
+def _gate_chain_candidates(network_data, ccxt_code):
     """
-    Return (fee_fixed, fee_percent, min_withdraw) from a currency's raw
-    info dict, using whatever the exchange actually provided. Any component
-    may be None if not present.
+    Return every name Gate might use as a key for this network: the ccxt
+    unified code, plus each raw chain name stored inside info.chains.
     """
-    info = (currency_info or {}).get("info") or {}
+    out = []
+    seen = set()
 
-    raw_fix = _raw_lookup_in_info(
-        info, network_code,
-        "withdraw_fix_on_chains",
-        "withdrawFixOnChains",
-        "withdraw_fix",
-    )
-    raw_pct = _raw_lookup_in_info(
-        info, network_code,
-        "withdraw_percent_on_chains",
-        "withdrawPercentOnChains",
-        "withdraw_percent",
-    )
-    raw_min = _raw_lookup_in_info(
-        info, network_code,
-        "withdraw_amount_min_on_chains",
-        "withdrawAmountMinOnChains",
-        "withdraw_amount_min",
-    )
+    def add(name):
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
 
-    fee_fixed = _to_float(raw_fix)
-    min_wd = _to_float(raw_min)
+    add(ccxt_code)
+    if isinstance(network_data, dict):
+        info = network_data.get("info") or {}
+        chains = info.get("chains")
+        if isinstance(chains, list):
+            for c in chains:
+                if isinstance(c, dict):
+                    add(c.get("name"))
+        add(info.get("chain"))
+    return out
 
-    fee_percent = None
-    if raw_pct is not None:
-        s = str(raw_pct).strip().rstrip("%").strip()
+
+def _gate_raw_withdraw_info(ex, base):
+    """
+    Fetch /wallet/withdraw_status for one currency via ccxt (which signs
+    the request). Returns dict[chain_name] -> {'fee': f, 'fee_percent': p,
+    'min': m}. Cached 30 minutes because it is a private endpoint.
+    """
+    base_up = base.upper()
+
+    with _GATE_WITHDRAW_INFO_LOCK:
+        cached = _GATE_WITHDRAW_INFO_CACHE.get(base_up)
+    if cached and (time.time() - cached["ts"]) < _GATE_WITHDRAW_INFO_TTL:
+        return cached["data"]
+
+    try:
+        method = (
+            getattr(ex, "privateWalletGetWithdrawStatus", None)
+            or getattr(ex, "private_wallet_get_withdraw_status", None)
+            or getattr(ex, "walletGetWithdrawStatus", None)
+            or getattr(ex, "wallet_get_withdraw_status", None)
+        )
+        if method is None:
+            result = {}
+        else:
+            rows = method({"currency": base_up})
+            result = _parse_gate_withdraw_rows(rows, base_up)
+    except Exception as e:
+        log.warning(f"  WARNING  Gate withdraw_status({base_up}): {str(e)[:200]}")
+        result = {}
+
+    with _GATE_WITHDRAW_INFO_LOCK:
+        _GATE_WITHDRAW_INFO_CACHE[base_up] = {"ts": time.time(), "data": result}
+    return result
+
+
+def _parse_gate_withdraw_rows(rows, base_up):
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if (row.get("currency") or "").upper() != base_up:
+            continue
+
         try:
-            fee_percent = float(s)
-        except (TypeError, ValueError):
-            fee_percent = None
+            log.info(f"  [gate-raw] {base_up} withdraw_status keys: {sorted(row.keys())}")
+        except Exception:
+            pass
 
-    return fee_fixed, fee_percent, min_wd
+        fix_map = row.get("withdraw_fix_on_chains") or {}
+        pct_map = row.get("withdraw_percent_on_chains") or {}
+        min_map = (
+            row.get("withdraw_amount_mini_on_chains")
+            or row.get("withdraw_amount_min_on_chains")
+            or {}
+        )
+
+        top_fix = row.get("withdraw_fix")
+        top_pct = row.get("withdraw_percent")
+        top_min = row.get("withdraw_amount_mini") or row.get("withdraw_amount_min")
+
+        chain_names = set(fix_map) | set(pct_map) | set(min_map)
+        if not chain_names and (top_fix is not None or top_min is not None):
+            primary = row.get("chain") or row.get("currency")
+            if primary:
+                chain_names = {primary}
+
+        out = {}
+        for net in chain_names:
+            fix = fix_map.get(net) if fix_map else top_fix
+            pct = pct_map.get(net) if pct_map else top_pct
+            mn  = min_map.get(net) if min_map else top_min
+
+            fee_f = _to_float(fix)
+            min_f = _to_float(mn)
+            pct_f = None
+            if pct not in (None, ""):
+                s = str(pct).strip().rstrip("%").strip()
+                try:
+                    pct_f = float(s)
+                except (TypeError, ValueError):
+                    pct_f = None
+
+            out[net] = {"fee": fee_f, "fee_percent": pct_f, "min": min_f}
+
+        return out
+    return {}
+
+
+def _enrich_gate_fee_min(exchange_name, base, networks, pct_map):
+    """
+    Merge Gate's per-chain fee/min into a ccxt network dict in place.
+    No-op if the exchange is not Gate or nothing to fetch.
+    """
+    if exchange_name != "Gate" or not networks:
+        return
+    gate_ex = ensure_exchange("Gate")
+    if gate_ex is None:
+        return
+    gate_map = _gate_raw_withdraw_info(gate_ex, base)
+    if not gate_map:
+        return
+    for code, data in networks.items():
+        if not isinstance(data, dict):
+            continue
+        hit = None
+        for cand in _gate_chain_candidates(data, code):
+            if cand in gate_map:
+                hit = gate_map[cand]
+                break
+        if not hit:
+            continue
+        if data.get("fee") is None and hit["fee"] is not None:
+            data["fee"] = hit["fee"]
+        existing_limits = dict(data.get("limits") or {})
+        existing_withdraw = dict(existing_limits.get("withdraw") or {})
+        if existing_withdraw.get("min") is None and hit["min"] is not None:
+            existing_withdraw["min"] = hit["min"]
+            existing_limits["withdraw"] = existing_withdraw
+            data["limits"] = existing_limits
+        if hit["fee_percent"] is not None:
+            pct_map[normalize_network(code)] = hit["fee_percent"]
 
 
 def _fill_missing_fee_min(exchange_name, base, networks, currency_data=None):
@@ -818,11 +891,10 @@ def _fill_missing_fee_min(exchange_name, base, networks, currency_data=None):
 
     Sources tried, in order:
       1. fetchDepositWithdrawFee(s) — ccxt's parsed structure
-      2. raw info dict — direct from the exchange's JSON, catches Gate's
-         map-style fee fields that ccxt 4.5.39 doesn't parse
+      2. Gate-specific /wallet/withdraw_status (only when exchange is Gate)
 
-    Never mutates the input dict or the currency cache. Also returns the
-    fee_percent if the exchange uses a mixed fixed+percent fee (Gate).
+    Never mutates the input dict or the currency cache. Returns a new dict
+    plus a map of normalized network -> fee_percent for Gate's mixed fees.
     """
     if not networks or not isinstance(networks, dict):
         return networks, {}
@@ -847,16 +919,12 @@ def _fill_missing_fee_min(exchange_name, base, networks, currency_data=None):
         fb_by_norm[normalize_network(fcode)].append((fcode, fdata))
 
     out = {}
-    fee_percent_by_norm = {}
-
     for code, data in networks.items():
         if not isinstance(data, dict):
             out[code] = data
             continue
-
         new_data = dict(data)
         norm = normalize_network(code)
-
         if _needs_fill(new_data):
             entries = fb_by_norm.get(norm, [])
             if entries:
@@ -871,23 +939,11 @@ def _fill_missing_fee_min(exchange_name, base, networks, currency_data=None):
                         existing_withdraw["min"] = f_withdraw["min"]
                         existing_limits["withdraw"] = existing_withdraw
                         new_data["limits"] = existing_limits
-
-        if _needs_fill(new_data) and currency_data is not None:
-            raw_fee, raw_pct, raw_min = _raw_network_fee_min(currency_data, code)
-            if new_data.get("fee") is None and raw_fee is not None:
-                new_data["fee"] = raw_fee
-            existing_limits = dict(new_data.get("limits") or {})
-            existing_withdraw = dict(existing_limits.get("withdraw") or {})
-            if existing_withdraw.get("min") is None and raw_min is not None:
-                existing_withdraw["min"] = raw_min
-                existing_limits["withdraw"] = existing_withdraw
-                new_data["limits"] = existing_limits
-            if raw_pct is not None:
-                fee_percent_by_norm[norm] = raw_pct
-
         out[code] = new_data
 
-    return out, fee_percent_by_norm
+    pct_map = {}
+    _enrich_gate_fee_min(exchange_name, base, out, pct_map)
+    return out, pct_map
 
 
 def _fmt_networks(networks):
@@ -1166,8 +1222,12 @@ def find_confirmed_pair(base, all_prices):
     sell_networks = best["sell_cur"].get("networks") or {}
     if not sell_networks:
         sell_networks = _fallback_networks(best["sell_ex"], base)
-    buy_networks, buy_pct_map = _fill_missing_fee_min(best["buy_ex"], base, buy_networks, best["buy_cur"])
-    sell_networks, _ = _fill_missing_fee_min(best["sell_ex"], base, sell_networks, best["sell_cur"])
+    buy_networks, buy_pct_map = _fill_missing_fee_min(
+        best["buy_ex"], base, buy_networks, best["buy_cur"]
+    )
+    sell_networks, _ = _fill_missing_fee_min(
+        best["sell_ex"], base, sell_networks, best["sell_cur"]
+    )
     buy_by_norm = defaultdict(list)
     for code, data in buy_networks.items():
         buy_by_norm[normalize_network(code)].append((code, data))
@@ -1209,8 +1269,7 @@ def find_confirmed_pair(base, all_prices):
     best["fee_percent"] = tradable_fee_percent
     if tradable_network:
         buy_by_norm_for_min = defaultdict(list)
-        raw_buy_nets = buy_networks
-        for code, data in raw_buy_nets.items():
+        for code, data in buy_networks.items():
             buy_by_norm_for_min[normalize_network(code)].append((code, data))
         entries_for_min = buy_by_norm_for_min.get(tradable_network)
         if entries_for_min:
@@ -1353,8 +1412,6 @@ def check_metadata(r):
     if not sell_networks:
         sell_networks = _fallback_networks(sell_ex, base)
 
-    # Top up missing fee/min (notably Gate's map-style raw info) so
-    # withdrawal_fee / withdrawal_min_tokens reflect reality.
     buy_networks,  buy_pct_map  = _fill_missing_fee_min(buy_ex,  base, buy_networks,  buy_cur)
     sell_networks, sell_pct_map = _fill_missing_fee_min(sell_ex, base, sell_networks, sell_cur)
 
@@ -1586,6 +1643,8 @@ def _find_key(obj, names):
 
 
 def _bingx_spot_taker_fee(ex, symbol):
+    # ccxt's BingX fetchTradingFee reads the futures commission endpoint and returns no rate for
+    # spot pairs, so call the spot endpoint (/openApi/spot/v1/user/commissionRate) directly.
     if not ex.markets:
         ex.load_markets()
     market = ex.market(symbol)
@@ -1727,6 +1786,9 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
         else True
     )
 
+    # Gate and some others charge "fixed + percent × amount". Apply the
+    # percentage to the tokens actually being withdrawn (tokens_after_buy_fee),
+    # which matches the exchange's own quoted formula.
     gas_tokens_fixed = fee_tokens if fee_tokens is not None else 0.0
     gas_tokens_percent = (
         (fee_percent / 100.0) * tokens_after_buy_fee
@@ -1955,8 +2017,8 @@ def print_results(results, scan_num, duration, counts):
                 pct = r.get("withdrawal_fee_percent")
                 fee_desc = (
                     f"{r['withdrawal_fee']} + {pct:.4f}%"
-                    if r['withdrawal_fee'] is not None and pct else
-                    (f"{r['withdrawal_fee']}" if r['withdrawal_fee'] is not None else "unknown")
+                    if r["withdrawal_fee"] is not None and pct else
+                    (f"{r['withdrawal_fee']}" if r["withdrawal_fee"] is not None else "unknown")
                 )
                 log.info(
                     f"       VERIFY  ✅ confirmed via {basis}  |  "
