@@ -221,8 +221,6 @@ def route_through_proxy(ex, mode):
         if parsed.query:
             new_url += f"?{parsed.query}"
 
-        # Short label for error messages — exchange API path only, no proxy
-        # hostname. This keeps every log line free of the InfinityFree URL.
         short_path = parsed.path or "/"
         if parsed.query:
             short_path += f"?{parsed.query}"
@@ -487,6 +485,172 @@ def _fallback_networks(exchange_name, base):
         log.warning(f"  WARNING  {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}")
     return {}
 
+
+# ----------------------------------------------------------------------
+#  Raw-info fee extraction (Gate etc.)
+#
+#  Gate's /spot/currencies response carries the fee data in currency-level
+#  maps instead of inside the per-chain objects ccxt reads from:
+#
+#      "chains": [{ "name": "BEP20", "withdraw_fix": "0", ... }]
+#      "withdraw_fix_on_chains":          { "BEP20": "7564525.4" }
+#      "withdraw_percent_on_chains":      { "BEP20": "2%" }
+#      "withdraw_amount_min_on_chains":   { "BEP20": "10000000" }
+#
+#  ccxt 4.5.39's gate parser only reads chains[].withdraw_fix, so the map
+#  values are lost — fee/min come back None. These helpers pull the real
+#  values out of info directly.
+# ----------------------------------------------------------------------
+def _raw_lookup_in_info(info, network_code, *map_keys):
+    """Look up network_code in any of the given map keys inside info."""
+    if not isinstance(info, dict):
+        return None
+
+    # Try the map-style containers first (Gate's new format).
+    for key in map_keys:
+        mapping = info.get(key)
+        if isinstance(mapping, dict):
+            val = mapping.get(network_code)
+            if val is not None and val != "":
+                return val
+
+    # Fall back to scanning the chains array (older format, still used by
+    # some exchanges and by Gate for a few fields).
+    chains = info.get("chains")
+    if isinstance(chains, list):
+        for chain in chains:
+            if not isinstance(chain, dict):
+                continue
+            if chain.get("name") != network_code:
+                continue
+            for key in map_keys:
+                val = chain.get(key)
+                if val is not None and val != "":
+                    return val
+    return None
+
+
+def _raw_network_fee_min(currency_info, network_code):
+    """
+    Return (fee_fixed, fee_percent, min_withdraw) from a currency's raw
+    info dict, using whatever the exchange actually provided. Any component
+    may be None if not present.
+    """
+    info = (currency_info or {}).get("info") or {}
+
+    raw_fix = _raw_lookup_in_info(
+        info, network_code,
+        "withdraw_fix_on_chains",
+        "withdrawFixOnChains",
+        "withdraw_fix",
+    )
+    raw_pct = _raw_lookup_in_info(
+        info, network_code,
+        "withdraw_percent_on_chains",
+        "withdrawPercentOnChains",
+        "withdraw_percent",
+    )
+    raw_min = _raw_lookup_in_info(
+        info, network_code,
+        "withdraw_amount_min_on_chains",
+        "withdrawAmountMinOnChains",
+        "withdraw_amount_min",
+    )
+
+    fee_fixed = _to_float(raw_fix)
+    min_wd = _to_float(raw_min)
+
+    fee_percent = None
+    if raw_pct is not None:
+        s = str(raw_pct).strip().rstrip("%").strip()
+        try:
+            fee_percent = float(s)
+        except (TypeError, ValueError):
+            fee_percent = None
+
+    return fee_fixed, fee_percent, min_wd
+
+
+def _fill_missing_fee_min(exchange_name, base, networks, currency_data=None):
+    """
+    Top up any fee/min that fetch_currencies() left as None.
+
+    Sources tried, in order:
+      1. fetchDepositWithdrawFee(s) — ccxt's parsed structure
+      2. raw info dict — direct from the exchange's JSON, catches Gate's
+         map-style fee fields that ccxt 4.5.39 doesn't parse
+
+    Never mutates the input dict or the currency cache. Also returns the
+    fee_percent if the exchange uses a mixed fixed+percent fee (Gate).
+    """
+    if not networks or not isinstance(networks, dict):
+        return networks, {}
+
+    def _needs_fill(data):
+        if not isinstance(data, dict):
+            return False
+        if data.get("fee") is None:
+            return True
+        min_w = ((data.get("limits") or {}).get("withdraw") or {}).get("min")
+        if min_w is None:
+            return True
+        return False
+
+    needs_fill_any = any(_needs_fill(d) for d in networks.values())
+
+    fallback = {}
+    if needs_fill_any:
+        fallback = _fallback_networks(exchange_name, base)
+    fb_by_norm = defaultdict(list)
+    for fcode, fdata in fallback.items():
+        fb_by_norm[normalize_network(fcode)].append((fcode, fdata))
+
+    out = {}
+    fee_percent_by_norm = {}
+
+    for code, data in networks.items():
+        if not isinstance(data, dict):
+            out[code] = data
+            continue
+
+        new_data = dict(data)
+        norm = normalize_network(code)
+
+        # 1) ccxt fallback
+        if _needs_fill(new_data):
+            entries = fb_by_norm.get(norm, [])
+            if entries:
+                _, fdata = entries[0]
+                if new_data.get("fee") is None and fdata.get("fee") is not None:
+                    new_data["fee"] = fdata["fee"]
+                existing_limits = dict(new_data.get("limits") or {})
+                existing_withdraw = dict(existing_limits.get("withdraw") or {})
+                if existing_withdraw.get("min") is None:
+                    f_withdraw = ((fdata.get("limits") or {}).get("withdraw") or {})
+                    if f_withdraw.get("min") is not None:
+                        existing_withdraw["min"] = f_withdraw["min"]
+                        existing_limits["withdraw"] = existing_withdraw
+                        new_data["limits"] = existing_limits
+
+        # 2) raw info — catches Gate's map-style fields
+        if _needs_fill(new_data) and currency_data is not None:
+            raw_fee, raw_pct, raw_min = _raw_network_fee_min(currency_data, code)
+            if new_data.get("fee") is None and raw_fee is not None:
+                new_data["fee"] = raw_fee
+            existing_limits = dict(new_data.get("limits") or {})
+            existing_withdraw = dict(existing_limits.get("withdraw") or {})
+            if existing_withdraw.get("min") is None and raw_min is not None:
+                existing_withdraw["min"] = raw_min
+                existing_limits["withdraw"] = existing_withdraw
+                new_data["limits"] = existing_limits
+            if raw_pct is not None:
+                fee_percent_by_norm[norm] = raw_pct
+
+        out[code] = new_data
+
+    return out, fee_percent_by_norm
+
+
 def _to_float(val):
     if val is None:
         return None
@@ -696,6 +860,7 @@ def meta_summary_for(exchange_name, base):
     networks = cur.get('networks') or {}
     if not networks:
         networks = _fallback_networks(exchange_name, base)
+    networks, _ = _fill_missing_fee_min(exchange_name, base, networks, cur)
     contract = None
     for net_data in networks.values():
         if isinstance(net_data, dict):
@@ -755,6 +920,8 @@ def find_confirmed_pair(base, all_prices):
     sell_networks = best['sell_cur'].get('networks') or {}
     if not sell_networks:
         sell_networks = _fallback_networks(best['sell_ex'], base)
+    buy_networks, _ = _fill_missing_fee_min(best['buy_ex'],  base, buy_networks,  best['buy_cur'])
+    sell_networks, _ = _fill_missing_fee_min(best['sell_ex'], base, sell_networks, best['sell_cur'])
     buy_by_norm = defaultdict(list)
     for code, data in buy_networks.items():
         buy_by_norm[normalize_network(code)].append((code, data))
@@ -803,6 +970,7 @@ def _route_profit(route, symbol):
     return calc_arb_profit(
         CAPITAL_USDT, buy_price, sell_price,
         fee_tokens=route.get('fee'),
+        fee_percent=route.get('fee_percent'),
         min_withdrawal_tokens=route.get('min_withdrawal'),
         buy_fees=buy_fees,
         sell_fees=sell_fees,
@@ -842,6 +1010,7 @@ def evaluate_network_block(
                 networks = cur.get('networks') or {}
                 if not networks:
                     networks = _fallback_networks(alt_ex, base)
+                networks, pct_map = _fill_missing_fee_min(alt_ex, base, networks, cur)
                 candidates = _network_entries_matching_contract(networks, cur, contract)
                 matched = next(
                     (c_d for c_d in candidates if normalize_network(c_d[0]) == norm_key),
@@ -865,6 +1034,7 @@ def evaluate_network_block(
                         'alt_price': alt_price,
                         'sell_price_ref': sell_price,
                         'fee': _to_float(data.get('fee')),
+                        'fee_percent': pct_map.get(normalize_network(code)),
                         'min_withdrawal': _to_float(
                             ((data.get('limits') or {}).get('withdraw') or {}).get('min')
                         ),
@@ -885,6 +1055,7 @@ def evaluate_network_block(
                 networks = cur.get('networks') or {}
                 if not networks:
                     networks = _fallback_networks(alt_ex, base)
+                networks, pct_map = _fill_missing_fee_min(alt_ex, base, networks, cur)
                 candidates = _network_entries_matching_contract(networks, cur, contract)
                 matched = next(
                     (c_d for c_d in candidates if normalize_network(c_d[0]) == norm_key),
@@ -909,6 +1080,7 @@ def evaluate_network_block(
                         'alt_price': alt_price,
                         'buy_price_ref': buy_price,
                         'fee': _to_float(buy_data_entry.get('fee')),
+                        'fee_percent': entry.get('buy_fee_percent'),
                         'min_withdrawal': _to_float(
                             ((buy_data_entry.get('limits') or {}).get('withdraw') or {}).get('min')
                         ),
@@ -1019,6 +1191,10 @@ def check_metadata(r):
         buy_networks = _fallback_networks(buy_ex, base)
     if not sell_networks:
         sell_networks = _fallback_networks(sell_ex, base)
+
+    buy_networks,  buy_pct_map  = _fill_missing_fee_min(buy_ex,  base, buy_networks,  buy_cur)
+    sell_networks, sell_pct_map = _fill_missing_fee_min(sell_ex, base, sell_networks, sell_cur)
+
     r['networks_known'] = bool(buy_networks) and bool(sell_networks)
     r['buy_meta_summary']  = f"{buy_ex}: name={buy_name!r}  networks: {_fmt_networks(buy_networks)}"
     r['sell_meta_summary'] = f"{sell_ex}: name={sell_name!r}  networks: {_fmt_networks(sell_networks)}"
@@ -1071,6 +1247,7 @@ def check_metadata(r):
                 'sell_code':    sell_code,
                 'can_withdraw': can_withdraw,
                 'can_deposit':  can_deposit,
+                'buy_fee_percent': buy_pct_map.get(normalize_network(buy_code)),
                 'other_blocked': (
                     other_deposit_blocks(base, norm_key, {buy_ex, sell_ex}, r['all_prices'])
                     if can_withdraw and not can_deposit else []
@@ -1100,6 +1277,7 @@ def check_metadata(r):
                 'sell_code':     sell_code,
                 'can_withdraw':  can_withdraw,
                 'can_deposit':   can_deposit,
+                'buy_fee_percent': buy_pct_map.get(normalize_network(buy_code)),
                 'other_blocked': [],
             })
 
@@ -1131,6 +1309,7 @@ def check_metadata(r):
         r['withdrawal_network_norm'] = normalize_network(buy_code)
         r['withdrawal_fee']        = _to_float(buy_data.get('fee'))
         r['withdrawal_min_tokens'] = _to_float(((buy_data.get('limits') or {}).get('withdraw') or {}).get('min'))
+        r['withdrawal_fee_percent'] = buy_pct_map.get(normalize_network(buy_code))
 
         withdraw_secs, withdraw_desc = _extract_time_estimate(buy_data, r['withdrawal_network_norm'])
         deposit_secs,  deposit_desc  = _extract_time_estimate(sell_data, r['withdrawal_network_norm'])
@@ -1405,6 +1584,7 @@ def fmt_vol(v):
     else:                return f"${v:.0f}"
 
 def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
+                    fee_percent=None,
                     min_withdrawal_tokens=None,
                     buy_fees=None, sell_fees=None):
     if not buy_price or buy_price <= 0 or not sell_price or sell_price <= 0:
@@ -1415,6 +1595,7 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
     buy_fee_rate  = buy_fees['taker']
     sell_fee_rate = sell_fees['taker']
     fee_tokens    = _to_float(fee_tokens)
+    fee_percent   = _to_float(fee_percent)
     min_withdrawal_tokens = _to_float(min_withdrawal_tokens)
 
     tokens_bought       = capital_usdt / buy_price
@@ -1427,7 +1608,16 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
         else True
     )
 
-    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
+    # Gate and some others charge "fixed + percent × amount". Apply the
+    # percentage to the tokens actually being withdrawn (tokens_after_buy_fee),
+    # which matches the exchange's own quoted formula.
+    gas_tokens_fixed   = fee_tokens if fee_tokens is not None else 0.0
+    gas_tokens_percent = (
+        (fee_percent / 100.0) * tokens_after_buy_fee
+        if fee_percent is not None and fee_percent > 0
+        else 0.0
+    )
+    gas_tokens = gas_tokens_fixed + gas_tokens_percent
     tokens_remaining = tokens_after_buy_fee - gas_tokens
 
     gross_sell_usdt = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
@@ -1451,6 +1641,9 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
         'min_withdrawal_tokens':  min_withdrawal_tokens,
         'min_withdrawal_met':     min_withdrawal_met,
         'gas_tokens':             gas_tokens,
+        'gas_tokens_fixed':       gas_tokens_fixed,
+        'gas_tokens_percent':     gas_tokens_percent,
+        'fee_percent':            fee_percent,
         'tokens_remaining':       tokens_remaining,
         'sell_fees':              sell_fees,
         'sell_fee_rate':          sell_fee_rate,
@@ -1478,7 +1671,14 @@ def log_profit_block(profit, symbol=None):
         mark = "✅" if profit['min_withdrawal_met'] else "❌"
         note = "met" if profit['min_withdrawal_met'] else "NOT MET — trade size too small to withdraw"
         log.info(f"       PROFIT Min withdrawal= {profit['min_withdrawal_tokens']:.6f} tokens  [{mark} {note}]")
-    log.info(f"       PROFIT Withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
+    if profit.get('fee_percent'):
+        log.info(
+            f"       PROFIT Withdrawal fee fixed= -{profit['gas_tokens_fixed']:.6f} {base}  "
+            f"(+{profit['fee_percent']:.4f}% = -{profit['gas_tokens_percent']:.6f})"
+        )
+        log.info(f"       PROFIT Withdrawal fee total= -{profit['gas_tokens']:.6f}")
+    else:
+        log.info(f"       PROFIT Withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
     log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
     log.info(
         f"       PROFIT Sell taker fee ({profit['sell_fee_rate'] * 100:.4f}% "
@@ -1551,7 +1751,16 @@ def save_trade_coin(r, profit):
     )
 
     min_withdrawal = profit.get('min_withdrawal_tokens')
-    gas_deducted   = profit.get('gas_tokens')
+    if min_withdrawal is None:
+        log.info(
+            f"       SAVE   ⚠️ {r.get('buy_ex')} did not publish a min_withdrawal for "
+            f"{coin_wd_network or 'this network'} — storing 0.0"
+        )
+        min_withdrawal = 0.0
+
+    gas_deducted = profit.get('gas_tokens')
+    if gas_deducted is None:
+        gas_deducted = 0.0
 
     row = {
         'pair':                  pair,
@@ -1779,6 +1988,9 @@ def get_usdt_network_data(exchange_name):
         if not existing.get('limits') and fb_data.get('limits'):
             existing['limits'] = fb_data['limits']
 
+    if usdt_cur:
+        networks, _ = _fill_missing_fee_min(exchange_name, 'USDT', networks, usdt_cur)
+
     return networks
 
 def _networks_by_norm(networks_raw, enabled_key):
@@ -1964,6 +2176,7 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
         'withdrawal_network':    None,
         'withdrawal_network_norm': None,
         'withdrawal_fee':        None,
+        'withdrawal_fee_percent': None,
         'withdrawal_min_tokens': None,
         'transfer_withdraw_seconds': None,
         'transfer_deposit_seconds':  None,
@@ -2030,6 +2243,7 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         profit = calc_arb_profit(
             CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
+            fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
             buy_fees=buy_fees,
             sell_fees=sell_fees,
@@ -2119,6 +2333,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         profit = calc_arb_profit(
             CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
+            fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
             buy_fees=buy_fees,
             sell_fees=sell_fees,
@@ -2231,9 +2446,15 @@ def print_pair_report_full(r, profit):
     if r['verified'] is True:
         basis = "contract address match" if r['contract_match'] is True else f"name '{r['buy_name']}' on both"
         min_wd = r['withdrawal_min_tokens']
+        pct = r.get('withdrawal_fee_percent')
+        fee_desc = (
+            f"{r['withdrawal_fee']} + {pct:.4f}%"
+            if r['withdrawal_fee'] is not None and pct else
+            (f"{r['withdrawal_fee']}" if r['withdrawal_fee'] is not None else "unknown")
+        )
         log.info(
             f"       VERIFY  ✅ confirmed via {basis}  |  "
-            f"network {r['withdrawal_network']}  fee {r['withdrawal_fee']}  "
+            f"network {r['withdrawal_network']}  fee {fee_desc}  "
             f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
         )
         if r.get('transfer_seconds') is not None:
