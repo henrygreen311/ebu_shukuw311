@@ -41,6 +41,11 @@ PROXY_TIMEOUT_MS = 20_000
 RETRY_ATTEMPTS = 2
 RETRY_DELAY = 2
 
+# MEXC rejects signed requests older than recvWindow (default 5s). Calls that
+# go through the proxy can take several seconds, and the proxy retry replays the
+# SAME signed URL, so the timestamp ages with every retry. 60s is MEXC's maximum.
+RECV_WINDOW_MS = {'mexc': 60_000}
+
 PROXY_RETRY_ATTEMPTS = 3
 PROXY_RETRY_BASE_DELAY = 1.0
 
@@ -76,6 +81,14 @@ DEPTH_FETCH_RETRY_DELAY = 2
 
 WORKER1_INTERVAL_SEC = 5 * 60
 FAIL_STREAK_LIMIT     = 3
+# Transient problems (exchange 5xx, fee/book temporarily unavailable) must not
+# burn the normal fail streak, but a pair that is *always* broken still goes.
+TRANSIENT_STREAK_LIMIT = 12
+WORKER2_TRANSIENT_RETRIES = 3
+WORKER2_RETRY_DELAY_SEC   = 30
+# After a confirmed rejection (whitelist, no deposit address, not listed ...) the
+# pair is kept out for this long even if something re-inserts it into arb_coins.
+REJECT_COOLDOWN_SEC = 60 * 60
 ROW_PROCESS_MAX_WORKERS = 8
 
 logging.basicConfig(
@@ -283,6 +296,8 @@ def build_exchange(name, mode):
         'timeout': timeout,
         'options': {'adjustForTimeDifference': True},
     }
+    if name_lower in RECV_WINDOW_MS:
+        cfg['options']['recvWindow'] = RECV_WINDOW_MS[name_lower]
 
     hostname_override = EXCHANGE_HOSTNAME_OVERRIDES.get(name_lower)
     if hostname_override:
@@ -304,11 +319,14 @@ def build_exchange(name, mode):
 
     if proxied:
         ex = route_through_proxy(ex, mode)
-        if name_lower == 'kucoin':
-            try:
-                ex.set_markets(ex.fetch_markets())
-            except Exception as e:
-                log.warning(f"  WARNING  KuCoin set_markets bootstrap failed: {str(e)[:300]}")
+        # Proxied exchanges skip load_markets() above, so ccxt would lazily call it on
+        # the first fetch_ticker(). For BingX/MEXC/etc. load_markets() also pulls the
+        # signed *currencies* endpoint, and when that one returns 502 the ticker call
+        # fails with it. Bootstrap markets from the public endpoint instead, with retries.
+        try:
+            with_retries(lambda: ex.set_markets(ex.fetch_markets()), f"{name} markets")
+        except Exception as e:
+            log.warning(f"  WARNING  {name} set_markets bootstrap failed: {str(e)[:300]}")
 
     if not proxied:
         try:
@@ -456,7 +474,7 @@ def compare_names(buy_name, sell_name, code):
         return None, True
     return None, False
 
-_CONTRACT_KEYS = ('contractAddress', 'contract_address', 'contract', 'tokenAddress', 'token_address', 'address')
+_CONTRACT_KEYS = ('contractAddress', 'contract_address', 'contract', 'tokenAddress', 'token_address', 'address', 'addr')
 
 def _extract_contract(network_data, currency_data=None):
     for source in (network_data, currency_data):
@@ -470,6 +488,25 @@ def _extract_contract(network_data, currency_data=None):
                     return val
     return None
 
+def _flatten_unified_fees(networks):
+    """
+    ccxt's unified fetchDepositWithdrawFee(s) nests the fee as
+    network['withdraw']['fee'], but every consumer in this file reads
+    network['fee']. Copy it up (fixed fees only, never a percentage) so this
+    fallback actually fills the gaps it was written to fill.
+    """
+    out = {}
+    for code, data in networks.items():
+        data = dict(data)
+        if data.get('fee') is None:
+            w = data.get('withdraw')
+            if isinstance(w, dict) and not w.get('percentage'):
+                fee = _to_float(w.get('fee'))
+                if fee is not None:
+                    data['fee'] = fee
+        out[code] = data
+    return out
+
 def _fallback_networks(exchange_name, base):
     ex = ensure_exchange(exchange_name)
     if ex is None:
@@ -477,10 +514,12 @@ def _fallback_networks(exchange_name, base):
     try:
         if getattr(ex, 'has', {}).get('fetchDepositWithdrawFee'):
             fee_data = ex.fetch_deposit_withdraw_fee(base)
-            return _clean_networks_dict((fee_data or {}).get('networks') or {})
+            return _flatten_unified_fees(_clean_networks_dict((fee_data or {}).get('networks') or {}))
         if getattr(ex, 'has', {}).get('fetchDepositWithdrawFees'):
             fee_data = ex.fetch_deposit_withdraw_fees([base])
-            return _clean_networks_dict(((fee_data or {}).get(base) or {}).get('networks') or {})
+            return _flatten_unified_fees(
+                _clean_networks_dict(((fee_data or {}).get(base) or {}).get('networks') or {})
+            )
     except Exception as e:
         log.warning(f"  WARNING  {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}")
     return {}
@@ -493,6 +532,40 @@ def _to_float(val):
     except (TypeError, ValueError):
         return None
 
+
+# ----------------------------------------------------------------------
+#  Gate fee/min enrichment
+#
+#  Gate's /spot/currencies response has NO fee/min data — only chain names,
+#  addresses, and disable flags. The fee and minimum live in the private
+#  /wallet/withdraw_status endpoint, which requires HMAC-signed headers
+#  (hence "Missing required header: Timestamp" if you curl it unsigned).
+#  ccxt's privateWalletGetWithdrawStatus signs the call for us.
+#
+#  Confirmed shape of /wallet/withdraw_status for SSV:
+#
+#    [
+#      {
+#        "currency": "SSV",
+#        "withdraw_fix": "0.354",                     <- top-level fee
+#        "withdraw_percent": "0%",                    <- top-level percent
+#        "withdraw_amount_mini": "0.00366435",        <- top-level minimum
+#        "withdraw_fix_on_chains":         {"ETH": "0.354"},
+#        "withdraw_percent_on_chains":     {"ETH": "0%"},
+#        "withdraw_amount_mini_on_chains": {...}      <- some currencies
+#      }
+#    ]
+#
+#  Notes:
+#   - The endpoint returns a LIST, not a single object.
+#   - Fee and percent have per-chain maps; the minimum has a top-level
+#     value on every currency we have inspected so far, and sometimes a
+#     per-chain map. We use whichever is present.
+#   - The maps are keyed by Gate's raw chain name ("ETH", "BEP20", ...),
+#     while ccxt normalizes the same network to a unified code ("ERC20",
+#     "BSC", ...). We match by trying the ccxt code and the raw chain
+#     name pulled from info.chains[].name.
+# ----------------------------------------------------------------------
 _GATE_WITHDRAW_INFO_CACHE = {}
 _GATE_WITHDRAW_INFO_LOCK = threading.Lock()
 _GATE_WITHDRAW_INFO_TTL = 1800
@@ -500,27 +573,64 @@ _GATE_WITHDRAW_INFO_TTL = 1800
 
 def _gate_chain_candidates(network_data, ccxt_code):
     """
-    Return every name Gate might use as a key for this network: the ccxt
-    unified code, plus each raw chain name stored inside info.chains.
+    Return every name Gate might use as a key for this network.
+
+    ccxt builds each network entry as {'id': <Gate chain name>, 'network': <unified
+    code>, 'info': <the raw chain dict>}, so the raw Gate chain name ("ETH", "BSC",
+    "TRX" ...) lives in network_data['id'] and info['name'] -- NOT in a nested
+    info['chains'] list. The old lookup only tried the unified code ("ERC20") and
+    info['chains'], so it never found the "ETH" key in withdraw_fix_on_chains and
+    fee/min stayed None. The nested-list shapes are kept as extra candidates.
     """
     out = []
     seen = set()
 
     def add(name):
-        if name and name not in seen:
+        if name and isinstance(name, str) and name not in seen:
             seen.add(name)
             out.append(name)
 
     add(ccxt_code)
     if isinstance(network_data, dict):
+        add(network_data.get("id"))
+        add(network_data.get("network"))
         info = network_data.get("info") or {}
-        chains = info.get("chains")
-        if isinstance(chains, list):
-            for c in chains:
-                if isinstance(c, dict):
-                    add(c.get("name"))
-        add(info.get("chain"))
+        if isinstance(info, dict):
+            add(info.get("name"))
+            add(info.get("chain"))
+            add(info.get("chain_name"))
+            chains = info.get("chains")
+            if isinstance(chains, list):
+                for c in chains:
+                    if isinstance(c, dict):
+                        add(c.get("name"))
+                        add(c.get("chain"))
     return out
+
+
+def _gate_match_chain(gate_map, network_data, ccxt_code, n_networks):
+    """
+    Find Gate's fee/min entry for one ccxt network.
+      1. exact chain-name match on any candidate
+      2. same network after normalize_network() (ERC20 == ETH, BEP20(BSC) == BSC ...)
+      3. the currency has exactly one chain on both sides
+    """
+    cands = _gate_chain_candidates(network_data, ccxt_code)
+    for cand in cands:
+        if cand in gate_map:
+            return gate_map[cand]
+
+    by_norm = defaultdict(list)
+    for key, val in gate_map.items():
+        by_norm[normalize_network(key)].append(val)
+    for cand in cands:
+        hits = by_norm.get(normalize_network(cand))
+        if hits:
+            return hits[0]
+
+    if len(gate_map) == 1 and n_networks == 1:
+        return next(iter(gate_map.values()))
+    return None
 
 
 def _gate_raw_withdraw_info(ex, base):
@@ -533,7 +643,7 @@ def _gate_raw_withdraw_info(ex, base):
 
     with _GATE_WITHDRAW_INFO_LOCK:
         cached = _GATE_WITHDRAW_INFO_CACHE.get(base_up)
-    if cached and (time.time() - cached["ts"]) < _GATE_WITHDRAW_INFO_TTL:
+    if cached and (time.time() - cached["ts"]) < cached.get("ttl", _GATE_WITHDRAW_INFO_TTL):
         return cached["data"]
 
     try:
@@ -552,8 +662,10 @@ def _gate_raw_withdraw_info(ex, base):
         log.warning(f"  WARNING  Gate withdraw_status({base_up}): {str(e)[:200]}")
         result = {}
 
+    # An empty result usually means a transient API failure -- do not pin it for 30 min.
+    ttl = _GATE_WITHDRAW_INFO_TTL if result else 60
     with _GATE_WITHDRAW_INFO_LOCK:
-        _GATE_WITHDRAW_INFO_CACHE[base_up] = {"ts": time.time(), "data": result}
+        _GATE_WITHDRAW_INFO_CACHE[base_up] = {"ts": time.time(), "data": result, "ttl": ttl}
     return result
 
 
@@ -566,9 +678,8 @@ def _parse_gate_withdraw_rows(rows, base_up):
         if (row.get("currency") or "").upper() != base_up:
             continue
 
-        # One-time diagnostic so we can see the exact keys Gate uses.
         try:
-            log.info(f"  [gate-raw] {base_up} withdraw_status keys: {sorted(row.keys())}")
+            log.debug(f"  [gate-raw] {base_up} withdraw_status keys: {sorted(row.keys())}")
         except Exception:
             pass
 
@@ -629,14 +740,11 @@ def _enrich_gate_fee_min(exchange_name, base, networks, pct_map):
     gate_map = _gate_raw_withdraw_info(gate_ex, base)
     if not gate_map:
         return
+    n_networks = sum(1 for d in networks.values() if isinstance(d, dict))
     for code, data in networks.items():
         if not isinstance(data, dict):
             continue
-        hit = None
-        for cand in _gate_chain_candidates(data, code):
-            if cand in gate_map:
-                hit = gate_map[cand]
-                break
+        hit = _gate_match_chain(gate_map, data, code, n_networks)
         if not hit:
             continue
         if data.get("fee") is None and hit["fee"] is not None:
@@ -1711,6 +1819,11 @@ def log_profit_block(profit, symbol=None):
         return
     base = symbol.split('/')[0] if symbol else "tokens"
     log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
+    if profit.get('buy_price_used') and profit.get('sell_price_used'):
+        log.info(
+            f"       PROFIT Priced at order-book avg: buy {fmt_price(profit['buy_price_used'])}  "
+            f"sell {fmt_price(profit['sell_price_used'])}"
+        )
     log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
     log.info(
         f"       PROFIT Buy taker fee ({profit['buy_fee_rate'] * 100:.4f}% "
@@ -2247,6 +2360,45 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
         'corrected_sell_depth_price': None,
     }
 
+def _execution_prices(r):
+    """
+    Prices the $CAPITAL fill would really get: the order-book averages from
+    check_depth(), not the ticker's top-of-book. (SWCH showed ask $0.0240 while the
+    book averaged $0.02497 -- the old profit looked +$0.69 on a -0.39% real gap.)
+
+    Returns (buy_px, sell_px, None) or (None, None, (reason, transient)).
+    """
+    if r.get('buy_depth_price') is None or r.get('sell_depth_price') is None:
+        return None, None, (
+            f"order book unavailable — cannot price a ${DEPTH_CHECK_USDT} fill", True
+        )
+    if not r.get('depth_ok'):
+        return None, None, (
+            f"order book too thin to fill ${DEPTH_CHECK_USDT} on one side", False
+        )
+    buy_px  = r['buy_depth_price']
+    sell_px = r['sell_depth_price']
+    if r.get('corrected_symbol'):
+        # name-corrected ticker: the sell side is a different symbol, so the
+        # depth price measured on the original symbol does not apply
+        sell_px = r.get('corrected_sell_depth_price') or r.get('corrected_sell_price')
+        if not sell_px:
+            return None, None, ("corrected-symbol sell price unavailable", True)
+    return buy_px, sell_px, None
+
+def _withdrawal_fee_unknown(r):
+    return r.get('withdrawal_fee') is None and not r.get('withdrawal_fee_percent')
+
+def _fee_unknown_result(r, buy_ex_name):
+    return {
+        'ok': False,
+        'reason': (
+            f"{buy_ex_name} withdrawal fee unknown for {r.get('withdrawal_network')} — "
+            f"refusing to price the trade with a 0 fee"
+        ),
+        'r': r, 'profit': None, 'transient': True,
+    }
+
 def _check_transfer_time(r):
     seconds = r.get('transfer_seconds')
     if seconds is None or seconds <= MAX_TRANSFER_TIME_SEC:
@@ -2270,7 +2422,7 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
                 'r': None, 'profit': None, 'delete': True,
             }
         if not buy_data or not sell_data:
-            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None, 'transient': True}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
             return {'ok': False, 'reason': 'invalid ask/bid price data', 'r': None, 'profit': None}
 
@@ -2285,13 +2437,21 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         if slow:
             return slow
 
+        if _withdrawal_fee_unknown(r):
+            return _fee_unknown_result(r, buy_ex_name)
+
+        buy_px, sell_px, px_problem = _execution_prices(r)
+        if px_problem:
+            reason, transient = px_problem
+            return {'ok': False, 'reason': reason, 'r': r, 'profit': None, 'transient': transient}
+
         buy_fees  = get_taker_fee(buy_ex_name,  symbol)
         sell_fees = get_taker_fee(sell_ex_name, symbol)
         if not buy_fees or not sell_fees:
-            return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None}
+            return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None, 'transient': True}
 
         profit = calc_arb_profit(
-            CAPITAL_USDT, r['buy_price'], r['sell_price'],
+            CAPITAL_USDT, buy_px, sell_px,
             fee_tokens=r['withdrawal_fee'],
             fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
@@ -2300,6 +2460,7 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         )
         if not profit:
             return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
+        profit['buy_price_used'], profit['sell_price_used'] = buy_px, sell_px
 
         ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USDT
         reason = None if ok else f"profit {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USDT} threshold"
@@ -2319,7 +2480,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                 'r': None, 'profit': None, 'delete': True,
             }
         if not buy_data or not sell_data:
-            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None}
+            return {'ok': False, 'reason': 'could not fetch fresh prices from one or both exchanges', 'r': None, 'profit': None, 'transient': True}
         if buy_data['ask'] <= 0 or sell_data['bid'] <= 0:
             return {'ok': False, 'reason': 'invalid ask/bid price data', 'r': None, 'profit': None}
 
@@ -2341,6 +2502,14 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         slow = _check_transfer_time(r)
         if slow:
             return slow
+
+        if _withdrawal_fee_unknown(r):
+            return _fee_unknown_result(r, buy_ex_name)
+
+        buy_px, sell_px, px_problem = _execution_prices(r)
+        if px_problem:
+            reason, transient = px_problem
+            return {'ok': False, 'reason': reason, 'r': r, 'profit': None, 'transient': transient}
 
         if not holder_ex:
             return {'ok': False, 'reason': 'bot_state.holds_usdt is not set — cannot validate the USDT transfer', 'r': r, 'profit': None}
@@ -2378,10 +2547,10 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         buy_fees  = get_taker_fee(buy_ex_name,  symbol)
         sell_fees = get_taker_fee(sell_ex_name, symbol)
         if not buy_fees or not sell_fees:
-            return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None}
+            return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None, 'transient': True}
 
         profit = calc_arb_profit(
-            CAPITAL_USDT, r['buy_price'], r['sell_price'],
+            CAPITAL_USDT, buy_px, sell_px,
             fee_tokens=r['withdrawal_fee'],
             fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
@@ -2390,6 +2559,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         )
         if not profit:
             return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
+        profit['buy_price_used'], profit['sell_price_used'] = buy_px, sell_px
 
         if usdt_plan and usdt_plan['network'] is not None:
             profit['usdt_transfer_fee_usd'] = usdt_plan['fee_usdt']
@@ -2473,6 +2643,8 @@ def print_pair_report_full(r, profit):
             log.info(f"       DEPTH  insufficient liquidity to verify — SKIP")
         else:
             status = "OK" if r['depth_ok'] else f"THIN (book ran out before ${DEPTH_CHECK_USDT} filled)"
+            if r['depth_gap_pct'] <= 0:
+                status += " — NO EDGE at real fill prices"
             log.info(
                 f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
                 f"sell avg {fmt_price(r['sell_depth_price'])}  "
@@ -2494,7 +2666,16 @@ def print_pair_report_full(r, profit):
         )
 
     if r['verified'] is True:
-        basis = "contract address match" if r['contract_match'] is True else f"name '{r['buy_name']}' on both"
+        if r['contract_match'] is True:
+            basis = "contract address match"
+        elif r.get('name_match') is True:
+            basis = f"name '{r['buy_name']}' on both"
+        else:
+            no_name = [
+                ex for ex, nm in ((r['buy_ex'], r['buy_name']), (r['sell_ex'], r['sell_name']))
+                if not name_is_informative(nm, r['symbol'].split('/')[0])
+            ]
+            basis = f"network match only (no usable token name from {', '.join(no_name) or 'either exchange'})"
         min_wd = r['withdrawal_min_tokens']
         pct = r.get('withdrawal_fee_percent')
         fee_desc = (
@@ -2636,6 +2817,23 @@ class ActiveTrade:
 
 active_trade = ActiveTrade()
 fail_streaks = defaultdict(int)
+transient_streaks = defaultdict(int)
+
+_REJECTED = {}
+_REJECTED_LOCK = threading.Lock()
+
+def _remember_rejection(symbol, buy_ex, sell_ex, reason):
+    with _REJECTED_LOCK:
+        _REJECTED[(symbol, buy_ex, sell_ex)] = (time.time(), reason)
+
+def _recent_rejection(symbol, buy_ex, sell_ex):
+    key = (symbol, buy_ex, sell_ex)
+    with _REJECTED_LOCK:
+        hit = _REJECTED.get(key)
+        if hit and (time.time() - hit[0]) >= REJECT_COOLDOWN_SEC:
+            _REJECTED.pop(key, None)
+            return None
+        return hit[1] if hit else None
 
 def worker1_loop():
     log.info(f"[worker1] started — scanning arb_coins every {WORKER1_INTERVAL_SEC}s (scanner mode)")
@@ -2655,6 +2853,18 @@ def worker1_loop():
                 buy_ex = row.get('buy_exchange')
                 sell_ex = row.get('sell_exchange')
                 if not (symbol and buy_ex and sell_ex):
+                    continue
+
+                earlier = _recent_rejection(symbol, buy_ex, sell_ex)
+                if earlier:
+                    log.info(
+                        f"[worker1] 🗑️  {symbol} ({buy_ex} -> {sell_ex}): rejected earlier "
+                        f"({earlier[:90]}) — removing again"
+                    )
+                    delete_arb_coin(symbol)
+                    active_trade.clear_if_matches(symbol)
+                    fail_streaks.pop(symbol, None)
+                    transient_streaks.pop(symbol, None)
                     continue
 
                 buy_cfg  = exchange_cfg.get(buy_ex.lower())
@@ -2718,15 +2928,30 @@ def worker1_loop():
             for symbol, buy_ex, sell_ex, check in outcomes:
                 if check['ok']:
                     fail_streaks.pop(symbol, None)
+                    transient_streaks.pop(symbol, None)
                     fresh_results.append(
                         (symbol, buy_ex, sell_ex, check['profit']['net_pnl'])
                     )
                 elif check.get('delete'):
                     log.info(f"[worker1] 🗑️  {symbol}: {check['reason']} — removing immediately")
+                    _remember_rejection(symbol, buy_ex, sell_ex, check['reason'])
                     delete_arb_coin(symbol)
                     fail_streaks.pop(symbol, None)
+                    transient_streaks.pop(symbol, None)
                     active_trade.clear_if_matches(symbol)
+                elif check.get('transient'):
+                    transient_streaks[symbol] += 1
+                    n = transient_streaks[symbol]
+                    log.info(
+                        f"[worker1] ⏳ {symbol}: {check['reason']}  "
+                        f"(temporary {n}/{TRANSIENT_STREAK_LIMIT}, not counted as a failed scan)"
+                    )
+                    if n >= TRANSIENT_STREAK_LIMIT:
+                        delete_arb_coin(symbol)
+                        transient_streaks.pop(symbol, None)
+                        active_trade.clear_if_matches(symbol)
                 else:
+                    transient_streaks.pop(symbol, None)
                     fail_streaks[symbol] += 1
                     streak = fail_streaks[symbol]
                     log.info(f"[worker1] ⚠️  {symbol}: {check['reason']}  (streak {streak}/{FAIL_STREAK_LIMIT})")
@@ -2752,11 +2977,25 @@ def worker2_loop():
             if not active:
                 continue
             log.info(f"[worker2] now watching {active['symbol']} ({active['buy_ex']} -> {active['sell_ex']})")
-            check = reverify_pair(active['symbol'], active['buy_ex'], active['sell_ex'])
+            check = None
+            for attempt in range(1, WORKER2_TRANSIENT_RETRIES + 1):
+                check = reverify_pair(active['symbol'], active['buy_ex'], active['sell_ex'])
+                if check['ok'] or check.get('delete') or not check.get('transient'):
+                    break
+                if attempt < WORKER2_TRANSIENT_RETRIES:
+                    log.info(
+                        f"[worker2] {active['symbol']}: {check['reason']} — "
+                        f"retry {attempt}/{WORKER2_TRANSIENT_RETRIES - 1} in {WORKER2_RETRY_DELAY_SEC}s"
+                    )
+                    time.sleep(WORKER2_RETRY_DELAY_SEC)
+                    cur = active_trade.get()
+                    if not cur or cur['symbol'] != active['symbol']:
+                        break
             if not check['ok']:
                 log.info(f"[worker2] {active['symbol']}: {check['reason']}")
                 if check.get('delete'):
-                    log.info(f"[worker2] 🗑️  {active['symbol']}: removing from arb_coins (confirmed whitelist rejection)")
+                    log.info(f"[worker2] 🗑️  {active['symbol']}: removing from arb_coins ({check['reason'][:90]})")
+                    _remember_rejection(active['symbol'], active['buy_ex'], active['sell_ex'], check['reason'])
                     delete_arb_coin(active['symbol'])
                     fail_streaks.pop(active['symbol'], None)
                     active_trade.clear_if_matches(active['symbol'])
