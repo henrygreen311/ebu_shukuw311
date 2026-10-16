@@ -41,9 +41,6 @@ PROXY_TIMEOUT_MS = 20_000
 RETRY_ATTEMPTS = 2
 RETRY_DELAY = 2
 
-# MEXC rejects signed requests older than recvWindow (default 5s). Calls that
-# go through the proxy can take several seconds, and the proxy retry replays the
-# SAME signed URL, so the timestamp ages with every retry. 60s is MEXC's maximum.
 RECV_WINDOW_MS = {'mexc': 60_000}
 
 PROXY_RETRY_ATTEMPTS = 3
@@ -51,8 +48,8 @@ PROXY_RETRY_BASE_DELAY = 1.0
 
 EXCHANGE_FAIL_BACKOFF_SEC = 600
 
-CAPITAL_USDT     = 20
-DEPTH_CHECK_USDT = 20
+CAPITAL_USDT     = 1000
+DEPTH_CHECK_USDT = 1000
 MIN_STORE_PROFIT_USDT = 0.1
 
 FEE_CACHE_TTL_SEC = 60 * 60

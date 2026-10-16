@@ -35,8 +35,8 @@ ALT_ROUTE_MIN_GAP_PERCENT = MIN_GAP_PERCENT
 MAX_PRICE_RATIO = 3.0
 MIN_CONFIRMED_PAIR_GAP = 3.0
 
-CAPITAL_USDT = 20
-DEPTH_CHECK_USDT = 20
+CAPITAL_USDT = 1000
+DEPTH_CHECK_USDT = 1000
 MIN_STORE_PROFIT_USDT = 0.1
 
 FEE_CACHE_TTL_SEC = 60 * 60
@@ -57,15 +57,11 @@ RETRY_ATTEMPTS = 1
 RETRY_DELAY = 1
 SCAN_INTERVAL_SEC = 5 * 60
 
-# Proxy hiccups (InfinityFree 5xx, timeouts) are common: retry with backoff.
 PROXY_RETRY_ATTEMPTS = 3
 PROXY_RETRY_BASE_DELAY = 1.0
 
-# MEXC rejects signed requests older than recvWindow (default 5s); 60s is its maximum.
 RECV_WINDOW_MS = {"mexc": 60_000}
 
-# If the analyzer deletes a row we inserted, do not put the same symbol straight
-# back (MGO/USDT bounced analyzer -> tracker -> analyzer every 5 minutes).
 REINSERT_COOLDOWN_SEC = 60 * 60
 
 logging.basicConfig(
