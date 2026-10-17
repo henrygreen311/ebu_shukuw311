@@ -1,3 +1,5 @@
+import ast
+import os
 import ccxt
 import re
 import time
@@ -48,9 +50,56 @@ PROXY_RETRY_BASE_DELAY = 1.0
 
 EXCHANGE_FAIL_BACKOFF_SEC = 600
 
-CAPITAL_USDT     = 1000
-DEPTH_CHECK_USDT = 1000
-MIN_STORE_PROFIT_USDT = 0.1
+def _load_shared_constants(names, filename="tracker.py"):
+    """
+    Read plain numeric constants from tracker.py WITHOUT importing it (importing would
+    run its logging setup and Supabase credential load). Handles literals, references
+    to earlier constants (DEPTH_CHECK_USDT = CAPITAL_USDT) and simple arithmetic.
+    Raises instead of falling back: these values size real trades, so a silent default
+    that differs from the tracker is worse than a failed start.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, filename)
+    try:
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+    except OSError as e:
+        raise RuntimeError(f"cannot read shared constants: {path}: {e}") from e
+
+    ops = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+           ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b}
+
+    def ev(node, env):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in env:
+            return env[node.id]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -ev(node.operand, env)
+        if isinstance(node, ast.BinOp) and type(node.op) in ops:
+            return ops[type(node.op)](ev(node.left, env), ev(node.right, env))
+        raise ValueError("not a simple numeric expression")
+
+    env = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            try:
+                env[node.targets[0].id] = ev(node.value, env)
+            except (ValueError, ZeroDivisionError):
+                continue
+
+    missing = [n for n in names if n not in env]
+    if missing:
+        raise RuntimeError(f"{filename} does not define numeric constant(s): {', '.join(missing)}")
+    return [env[n] for n in names]
+
+
+# Shared with tracker.py -- change them THERE, not here.
+CAPITAL_USDT, DEPTH_CHECK_USDT, MIN_STORE_PROFIT_USDT = _load_shared_constants(
+    ("CAPITAL_USDT", "DEPTH_CHECK_USDT", "MIN_STORE_PROFIT_USDT")
+)
 
 FEE_CACHE_TTL_SEC = 60 * 60
 FEE_RETRY_AFTER_FAIL_SEC = 60
@@ -3007,7 +3056,7 @@ def main():
     log.info("trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)")
     log.info(f"worker1 interval: {WORKER1_INTERVAL_SEC}s  |  worker2: event-driven")
     log.info(f"Min qualifying profit: ${MIN_STORE_PROFIT_USDT}  |  fail-streak limit: {FAIL_STREAK_LIMIT}")
-    log.info(f"Capital: {CAPITAL_USDT} USDT  |  depth check: {DEPTH_CHECK_USDT} USDT")
+    log.info(f"Capital: {CAPITAL_USDT} USDT  |  depth check: {DEPTH_CHECK_USDT} USDT  (read from tracker.py)")
     log.info(
         f"Transfer time policy: reject only when exchange explicitly reports > "
         f"{MAX_TRANSFER_TIME_SEC // 60}min; unknown times assume the ceiling and pass"
