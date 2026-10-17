@@ -12,7 +12,7 @@ RUN_TRADER = False
 # Show logs for each script
 # ==========================
 SHOW_TRACKER_LOGS = True
-SHOW_ANALYZER_LOGS = True
+SHOW_ANALYZER_LOGS = False
 SHOW_TRADER_LOGS = False
 
 processes = []
