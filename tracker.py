@@ -585,6 +585,10 @@ def check_depth(r):
     sell_price, _, sell_ok = walk_book(bids, DEPTH_CHECK_USDT)
 
     r["depth_checked"] = True
+    # best level of the book actually fetched, to compare with the ticker price (a big
+    # difference means the ticker was stale or the book is not what the ticker showed)
+    r["buy_book_top"] = asks[0][0] if asks and len(asks[0]) >= 1 else None
+    r["sell_book_top"] = bids[0][0] if bids and len(bids[0]) >= 1 else None
     if buy_price is None or sell_price is None or buy_price <= 0:
         r["depth_ok"] = False
         return r
@@ -2221,6 +2225,16 @@ def print_results(results, scan_num, duration, counts):
                 )
                 if r["depth_gap_pct"] <= 0:
                     status += " — NO EDGE at real fill prices"
+                for side, top, ticker, label in (
+                    ("buy", r.get("buy_book_top"), r["buy_price"], "ask"),
+                    ("sell", r.get("sell_book_top"), r["sell_price"], "bid"),
+                ):
+                    if top and ticker and abs(top - ticker) / ticker > 0.01:
+                        log.info(
+                            f"       BOOK   ⚠️ {side} side: order book best {label} {fmt_price(top)} vs "
+                            f"ticker {label} {fmt_price(ticker)} ({(top - ticker) / ticker * 100:+.1f}%) "
+                            "— ticker was stale or the book differs"
+                        )
                 log.info(
                     f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
                     f"sell avg {fmt_price(r['sell_depth_price'])}  "
