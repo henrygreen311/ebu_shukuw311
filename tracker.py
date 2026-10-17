@@ -168,6 +168,23 @@ CREDENTIALS = load_api_credentials()
 TIMEOUT_MS = 10_000
 
 
+# Exchanges whose API key was rejected at runtime (e.g. MEXC code 10072 "Api key info
+# invalid"). ccxt sends the key header even on PUBLIC calls, so a dead key makes the
+# whole exchange fail, prices included. Those exchanges are rebuilt without credentials.
+KEYLESS_EXCHANGES = set()
+
+_AUTH_ERROR_MARKERS = (
+    "10072", "api key info invalid", "invalid api-key", "invalid api key", "invalid apikey",
+)
+
+
+def _is_auth_error(exc):
+    if isinstance(exc, ccxt.AuthenticationError):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _AUTH_ERROR_MARKERS)
+
+
 def ccxt_config(exchange_id_lower):
     proxied = exchange_id_lower in PROXY_EXCHANGE_IDS
     cfg = {
@@ -185,6 +202,8 @@ def ccxt_config(exchange_id_lower):
         cfg["hostname"] = hostname_override
 
     creds = CREDENTIALS.get(exchange_id_lower)
+    if exchange_id_lower in KEYLESS_EXCHANGES:
+        return cfg  # key was rejected: public endpoints only
     if creds:
         if creds.get("apiKey"):
             cfg["apiKey"] = creds["apiKey"]
@@ -330,9 +349,30 @@ def get_usdt_tickers(name):
     try:
         tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
     except Exception as e:
-        log.warning(f"  WARNING  {name}: {str(e)[:800]}")
-        EXCHANGES[name] = None
-        return {}
+        tickers = None
+        if (
+            _is_auth_error(e)
+            and name.lower() not in KEYLESS_EXCHANGES
+            and CREDENTIALS.get(name.lower())
+        ):
+            log.warning(
+                f"  WARNING  {name}: API key REJECTED by the exchange ({str(e)[:120]}) — "
+                "replace the key in Supabase api_keys (it was probably deleted, expired or "
+                "regenerated). Falling back to public data: prices and order books work, but "
+                f"network, fee and withdrawal data for {name} are unavailable until then."
+            )
+            KEYLESS_EXCHANGES.add(name.lower())
+            EXCHANGES[name] = None
+            ex = ensure_exchange(name)
+            if ex is not None:
+                try:
+                    tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
+                except Exception as e2:
+                    e = e2
+        if tickers is None:
+            log.warning(f"  WARNING  {name}: {str(e)[:800]}")
+            EXCHANGES[name] = None
+            return {}
     markets = getattr(ex, "markets", None) or {}
     result = {}
     for symbol, t in tickers.items():
