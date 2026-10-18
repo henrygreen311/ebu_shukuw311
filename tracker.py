@@ -585,10 +585,6 @@ def check_depth(r):
     sell_price, _, sell_ok = walk_book(bids, DEPTH_CHECK_USDT)
 
     r["depth_checked"] = True
-    # best level of the book actually fetched, to compare with the ticker price (a big
-    # difference means the ticker was stale or the book is not what the ticker showed)
-    r["buy_book_top"] = asks[0][0] if asks and len(asks[0]) >= 1 else None
-    r["sell_book_top"] = bids[0][0] if bids and len(bids[0]) >= 1 else None
     if buy_price is None or sell_price is None or buy_price <= 0:
         r["depth_ok"] = False
         return r
@@ -1913,48 +1909,9 @@ def fmt_vol(v):
     else:                return f"${v:.0f}"
 
 
-def _execution_prices(r):
-    """
-    Prices the CAPITAL_USDT fill would really get: the order-book averages from
-    check_depth(), not the ticker's top-of-book. Returns (buy_px, sell_px, None) or
-    (None, None, reason).
-    """
-    if r.get("buy_depth_price") is None or r.get("sell_depth_price") is None:
-        return None, None, f"order book unavailable — cannot price a {DEPTH_CHECK_USDT} USDT fill"
-    if not r.get("depth_ok"):
-        return None, None, f"order book too thin to fill {DEPTH_CHECK_USDT} USDT on one side"
-    buy_px, sell_px = r["buy_depth_price"], r["sell_depth_price"]
-    if r.get("corrected_symbol"):
-        # the DEPTH sell price was measured on the wrong-token symbol
-        sell_px = r.get("corrected_sell_depth_price") or r.get("corrected_sell_price")
-        if not sell_px:
-            return None, None, "corrected-symbol sell price unavailable"
-    return buy_px, sell_px, None
-
-
-def _leg_depth_prices(buy_ex, sell_ex, symbol):
-    """Order-book prices for an alternative route (alt_ex legs have no depth data yet)."""
-    buy_venue, sell_venue = ensure_exchange(buy_ex), ensure_exchange(sell_ex)
-    if buy_venue is None or sell_venue is None:
-        return None, None, "exchange unavailable for the depth check"
-    buy_ob = _fetch_order_book_safe(buy_ex, buy_venue, symbol)
-    sell_ob = _fetch_order_book_safe(sell_ex, sell_venue, symbol)
-    if buy_ob is None or sell_ob is None:
-        return None, None, "order book unavailable — cannot price the fill"
-    buy_px, _, buy_ok = walk_book(_sort_book_side(buy_ob.get("asks", []) or [], "asks"), DEPTH_CHECK_USDT)
-    sell_px, _, sell_ok = walk_book(_sort_book_side(sell_ob.get("bids", []) or [], "bids"), DEPTH_CHECK_USDT)
-    if not buy_px or not sell_px:
-        return None, None, "order book empty on one side"
-    if not (buy_ok and sell_ok):
-        return None, None, f"order book too thin to fill {DEPTH_CHECK_USDT} USDT on one side"
-    return buy_px, sell_px, None
-
-
-def _price_and_store(symbol, buy_ex, sell_ex, buy_px, sell_px, problem,
+def _price_and_store(symbol, buy_ex, sell_ex, buy_px, sell_px, real_gap,
                      fee, fee_percent, min_withdrawal, network):
-    if problem:
-        log.info(f"       PROFIT not calculated — {problem}")
-        return None
+    """Profit is priced at the ticker ask/bid (original tracker logic)."""
     buy_fees = get_taker_fee(buy_ex, symbol)
     sell_fees = get_taker_fee(sell_ex, symbol)
     profit = calc_arb_profit(
@@ -1965,10 +1922,7 @@ def _price_and_store(symbol, buy_ex, sell_ex, buy_px, sell_px, problem,
         buy_fees=buy_fees,
         sell_fees=sell_fees,
     )
-    if profit:
-        profit["buy_price_used"], profit["sell_price_used"] = buy_px, sell_px
     log_profit_block(profit, symbol)
-    real_gap = ((sell_px - buy_px) / buy_px) * 100
     maybe_store_arb_coin(symbol, real_gap, buy_ex, buy_px, sell_ex, sell_px, profit, network)
     return profit
 
@@ -2049,11 +2003,6 @@ def log_profit_block(profit, symbol=None):
         return
     base = symbol.split("/")[0] if symbol else "tokens"
     log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
-    if profit.get("buy_price_used") and profit.get("sell_price_used"):
-        log.info(
-            f"       PROFIT Priced at order-book avg: buy {fmt_price(profit['buy_price_used'])}  "
-            f"sell {fmt_price(profit['sell_price_used'])}"
-        )
     log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
     log.info(
         f"       PROFIT Buy taker fee ({profit['buy_fee_rate'] * 100:.4f}% "
@@ -2223,18 +2172,6 @@ def print_results(results, scan_num, duration, counts):
                     if r["depth_ok"]
                     else f"THIN (book ran out before {DEPTH_CHECK_USDT} USDT filled)"
                 )
-                if r["depth_gap_pct"] <= 0:
-                    status += " — NO EDGE at real fill prices"
-                for side, top, ticker, label in (
-                    ("buy", r.get("buy_book_top"), r["buy_price"], "ask"),
-                    ("sell", r.get("sell_book_top"), r["sell_price"], "bid"),
-                ):
-                    if top and ticker and abs(top - ticker) / ticker > 0.01:
-                        log.info(
-                            f"       BOOK   ⚠️ {side} side: order book best {label} {fmt_price(top)} vs "
-                            f"ticker {label} {fmt_price(ticker)} ({(top - ticker) / ticker * 100:+.1f}%) "
-                            "— ticker was stale or the book differs"
-                        )
                 log.info(
                     f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
                     f"sell avg {fmt_price(r['sell_depth_price'])}  "
@@ -2283,9 +2220,9 @@ def print_results(results, scan_num, duration, counts):
                     f"network {r['withdrawal_network']}  fee {fee_desc}  "
                     f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
                 )
-                buy_px, sell_px, problem = _execution_prices(r)
+                real_gap = r["depth_gap_pct"] if r["depth_gap_pct"] is not None else r["gap_pct"]
                 _price_and_store(
-                    r["symbol"], r["buy_ex"], r["sell_ex"], buy_px, sell_px, problem,
+                    r["symbol"], r["buy_ex"], r["sell_ex"], r["buy_price"], r["sell_price"], real_gap,
                     r["withdrawal_fee"], r.get("withdrawal_fee_percent"),
                     r["withdrawal_min_tokens"], r["withdrawal_network"],
                 )
@@ -2303,9 +2240,8 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['alt_ex']} → {ar['sell_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_px, sell_px, problem = _leg_depth_prices(ar["alt_ex"], r["sell_ex"], r["symbol"])
                     _price_and_store(
-                        r["symbol"], ar["alt_ex"], r["sell_ex"], buy_px, sell_px, problem,
+                        r["symbol"], ar["alt_ex"], r["sell_ex"], ar["alt_price"], r["sell_price"], ar["gap_pct"],
                         ar.get("fee"), ar.get("fee_percent"), ar.get("min_withdrawal"), ar["network"],
                     )
                 else:
@@ -2317,9 +2253,8 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['buy_ex']} → {ar['alt_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_px, sell_px, problem = _leg_depth_prices(r["buy_ex"], ar["alt_ex"], r["symbol"])
                     _price_and_store(
-                        r["symbol"], r["buy_ex"], ar["alt_ex"], buy_px, sell_px, problem,
+                        r["symbol"], r["buy_ex"], ar["alt_ex"], r["buy_price"], ar["alt_price"], ar["gap_pct"],
                         ar.get("fee"), ar.get("fee_percent"), ar.get("min_withdrawal"), ar["network"],
                     )
             elif r["verified"] is False:
@@ -2385,9 +2320,8 @@ def print_results(results, scan_num, duration, counts):
                             f"       VERIFY  ✅ Tradable via {cp['buy_ex']} → {cp['sell_ex']} | "
                             f"network {cp['tradable_network']} 🚀"
                         )
-                        buy_px, sell_px, problem = _leg_depth_prices(cp["buy_ex"], cp["sell_ex"], r["symbol"])
                         _price_and_store(
-                            r["symbol"], cp["buy_ex"], cp["sell_ex"], buy_px, sell_px, problem,
+                            r["symbol"], cp["buy_ex"], cp["sell_ex"], cp["buy_price"], cp["sell_price"], cp["gap_pct"],
                             cp.get("fee"), cp.get("fee_percent"), cp.get("min_withdrawal"),
                             cp["tradable_network"],
                         )

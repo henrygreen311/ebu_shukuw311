@@ -1865,11 +1865,6 @@ def log_profit_block(profit, symbol=None):
         return
     base = symbol.split('/')[0] if symbol else "tokens"
     log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
-    if profit.get('buy_price_used') and profit.get('sell_price_used'):
-        log.info(
-            f"       PROFIT Priced at order-book avg: buy {fmt_price(profit['buy_price_used'])}  "
-            f"sell {fmt_price(profit['sell_price_used'])}"
-        )
     log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
     log.info(
         f"       PROFIT Buy taker fee ({profit['buy_fee_rate'] * 100:.4f}% "
@@ -2406,32 +2401,6 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
         'corrected_sell_depth_price': None,
     }
 
-def _execution_prices(r):
-    """
-    Prices the $CAPITAL fill would really get: the order-book averages from
-    check_depth(), not the ticker's top-of-book. (SWCH showed ask $0.0240 while the
-    book averaged $0.02497 -- the old profit looked +$0.69 on a -0.39% real gap.)
-
-    Returns (buy_px, sell_px, None) or (None, None, (reason, transient)).
-    """
-    if r.get('buy_depth_price') is None or r.get('sell_depth_price') is None:
-        return None, None, (
-            f"order book unavailable — cannot price a ${DEPTH_CHECK_USDT} fill", True
-        )
-    if not r.get('depth_ok'):
-        return None, None, (
-            f"order book too thin to fill ${DEPTH_CHECK_USDT} on one side", False
-        )
-    buy_px  = r['buy_depth_price']
-    sell_px = r['sell_depth_price']
-    if r.get('corrected_symbol'):
-        # name-corrected ticker: the sell side is a different symbol, so the
-        # depth price measured on the original symbol does not apply
-        sell_px = r.get('corrected_sell_depth_price') or r.get('corrected_sell_price')
-        if not sell_px:
-            return None, None, ("corrected-symbol sell price unavailable", True)
-    return buy_px, sell_px, None
-
 def _withdrawal_fee_unknown(r):
     return r.get('withdrawal_fee') is None and not r.get('withdrawal_fee_percent')
 
@@ -2486,18 +2455,13 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         if _withdrawal_fee_unknown(r):
             return _fee_unknown_result(r, buy_ex_name)
 
-        buy_px, sell_px, px_problem = _execution_prices(r)
-        if px_problem:
-            reason, transient = px_problem
-            return {'ok': False, 'reason': reason, 'r': r, 'profit': None, 'transient': transient}
-
         buy_fees  = get_taker_fee(buy_ex_name,  symbol)
         sell_fees = get_taker_fee(sell_ex_name, symbol)
         if not buy_fees or not sell_fees:
             return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None, 'transient': True}
 
         profit = calc_arb_profit(
-            CAPITAL_USDT, buy_px, sell_px,
+            CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
             fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
@@ -2506,7 +2470,6 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         )
         if not profit:
             return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
-        profit['buy_price_used'], profit['sell_price_used'] = buy_px, sell_px
 
         ok = profit['net_pnl'] >= MIN_STORE_PROFIT_USDT
         reason = None if ok else f"profit {profit['net_pnl']:+.4f} USDT below ${MIN_STORE_PROFIT_USDT} threshold"
@@ -2552,11 +2515,6 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         if _withdrawal_fee_unknown(r):
             return _fee_unknown_result(r, buy_ex_name)
 
-        buy_px, sell_px, px_problem = _execution_prices(r)
-        if px_problem:
-            reason, transient = px_problem
-            return {'ok': False, 'reason': reason, 'r': r, 'profit': None, 'transient': transient}
-
         if not holder_ex:
             return {'ok': False, 'reason': 'bot_state.holds_usdt is not set — cannot validate the USDT transfer', 'r': r, 'profit': None}
         usdt_plan = plan_usdt_transfer(holder_ex, buy_ex_name, exchange_cfg)
@@ -2596,7 +2554,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             return {'ok': False, 'reason': 'taker fee unavailable (see warnings)', 'r': r, 'profit': None, 'transient': True}
 
         profit = calc_arb_profit(
-            CAPITAL_USDT, buy_px, sell_px,
+            CAPITAL_USDT, r['buy_price'], r['sell_price'],
             fee_tokens=r['withdrawal_fee'],
             fee_percent=r.get('withdrawal_fee_percent'),
             min_withdrawal_tokens=r['withdrawal_min_tokens'],
@@ -2605,7 +2563,6 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         )
         if not profit:
             return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
-        profit['buy_price_used'], profit['sell_price_used'] = buy_px, sell_px
 
         if usdt_plan and usdt_plan['network'] is not None:
             profit['usdt_transfer_fee_usd'] = usdt_plan['fee_usdt']
@@ -2689,8 +2646,6 @@ def print_pair_report_full(r, profit):
             log.info(f"       DEPTH  insufficient liquidity to verify — SKIP")
         else:
             status = "OK" if r['depth_ok'] else f"THIN (book ran out before ${DEPTH_CHECK_USDT} filled)"
-            if r['depth_gap_pct'] <= 0:
-                status += " — NO EDGE at real fill prices"
             log.info(
                 f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
                 f"sell avg {fmt_price(r['sell_depth_price'])}  "
