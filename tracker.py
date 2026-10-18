@@ -1,7 +1,6 @@
 import ccxt
 import re
 import time
-import random
 import json
 import logging
 import requests
@@ -35,10 +34,8 @@ ALT_ROUTE_MIN_GAP_PERCENT = MIN_GAP_PERCENT
 MAX_PRICE_RATIO = 3.0
 MIN_CONFIRMED_PAIR_GAP = 3.0
 
-# analyzer.py reads CAPITAL_USDT, DEPTH_CHECK_USDT and MIN_STORE_PROFIT_USDT from this
-# file (see _load_shared_constants there). Edit them here only.
-CAPITAL_USDT = 100
-DEPTH_CHECK_USDT = CAPITAL_USDT
+CAPITAL_USDT = 1000
+DEPTH_CHECK_USDT = 1000
 MIN_STORE_PROFIT_USDT = 0.1
 
 FEE_CACHE_TTL_SEC = 60 * 60
@@ -59,13 +56,6 @@ RETRY_ATTEMPTS = 1
 RETRY_DELAY = 1
 SCAN_INTERVAL_SEC = 5 * 60
 
-PROXY_RETRY_ATTEMPTS = 3
-PROXY_RETRY_BASE_DELAY = 1.0
-
-RECV_WINDOW_MS = {"mexc": 60_000}
-
-REINSERT_COOLDOWN_SEC = 60 * 60
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -78,10 +68,6 @@ log = logging.getLogger()
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-
-def _sleep_with_jitter(base_delay, attempt):
-    time.sleep(base_delay * attempt + random.uniform(0, base_delay * 0.5))
 
 
 def with_retries(fn, label):
@@ -168,23 +154,6 @@ CREDENTIALS = load_api_credentials()
 TIMEOUT_MS = 10_000
 
 
-# Exchanges whose API key was rejected at runtime (e.g. MEXC code 10072 "Api key info
-# invalid"). ccxt sends the key header even on PUBLIC calls, so a dead key makes the
-# whole exchange fail, prices included. Those exchanges are rebuilt without credentials.
-KEYLESS_EXCHANGES = set()
-
-_AUTH_ERROR_MARKERS = (
-    "10072", "api key info invalid", "invalid api-key", "invalid api key", "invalid apikey",
-)
-
-
-def _is_auth_error(exc):
-    if isinstance(exc, ccxt.AuthenticationError):
-        return True
-    msg = str(exc).lower()
-    return any(m in msg for m in _AUTH_ERROR_MARKERS)
-
-
 def ccxt_config(exchange_id_lower):
     proxied = exchange_id_lower in PROXY_EXCHANGE_IDS
     cfg = {
@@ -194,16 +163,12 @@ def ccxt_config(exchange_id_lower):
             "adjustForTimeDifference": True,
         },
     }
-    if exchange_id_lower in RECV_WINDOW_MS:
-        cfg["options"]["recvWindow"] = RECV_WINDOW_MS[exchange_id_lower]
 
     hostname_override = EXCHANGE_HOSTNAME_OVERRIDES.get(exchange_id_lower)
     if hostname_override:
         cfg["hostname"] = hostname_override
 
     creds = CREDENTIALS.get(exchange_id_lower)
-    if exchange_id_lower in KEYLESS_EXCHANGES:
-        return cfg  # key was rejected: public endpoints only
     if creds:
         if creds.get("apiKey"):
             cfg["apiKey"] = creds["apiKey"]
@@ -241,41 +206,30 @@ def route_through_proxy(ex):
         new_url = f"{PROXY_BASE}/{exchange_key}{path}"
         if parsed.query:
             new_url += f"?{parsed.query}"
-        # label without the query string: signed requests carry timestamp+signature there
-        short_label = f"{exchange_key} {method} {path}"
 
-        last_err = None
-        for attempt in range(1, PROXY_RETRY_ATTEMPTS + 1):
-            try:
-                resp = _proxy_session.request(
-                    method,
-                    new_url,
-                    headers=request_headers,
-                    cookies=proxy_cookies,
-                    data=body if method != "GET" else None,
-                    timeout=20,
-                )
-            except (requests.ConnectionError, requests.Timeout) as e:
-                last_err = Exception(f"{short_label} -> {type(e).__name__}")
-                if attempt < PROXY_RETRY_ATTEMPTS:
-                    _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
-                    continue
-                raise last_err
-
-            if resp.status_code >= 500:
-                last_err = Exception(f"{short_label} -> HTTP {resp.status_code}")
-                if attempt < PROXY_RETRY_ATTEMPTS:
-                    _sleep_with_jitter(PROXY_RETRY_BASE_DELAY, attempt)
-                    continue
-                raise last_err
-
+        def do_request():
+            resp = _proxy_session.request(
+                method,
+                new_url,
+                headers=request_headers,
+                cookies=proxy_cookies,
+                data=body if method != "GET" else None,
+                timeout=20,
+            )
             if resp.status_code >= 400:
-                raise Exception(f"{short_label} -> HTTP {resp.status_code}: {resp.text[:300]}")
-
+                raise Exception(
+                    f"{exchange_key} {method} {new_url} -> "
+                    f"{resp.status_code}: {resp.text[:300]}"
+                )
             try:
                 return json.loads(resp.text)
             except ValueError:
                 return resp.text
+
+        try:
+            return do_request()
+        except Exception:
+            return do_request()
 
     ex.fetch = proxied_fetch
     if exchange_key == "bybit":
@@ -349,30 +303,9 @@ def get_usdt_tickers(name):
     try:
         tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
     except Exception as e:
-        tickers = None
-        if (
-            _is_auth_error(e)
-            and name.lower() not in KEYLESS_EXCHANGES
-            and CREDENTIALS.get(name.lower())
-        ):
-            log.warning(
-                f"  WARNING  {name}: API key REJECTED by the exchange ({str(e)[:120]}) — "
-                "replace the key in Supabase api_keys (it was probably deleted, expired or "
-                "regenerated). Falling back to public data: prices and order books work, but "
-                f"network, fee and withdrawal data for {name} are unavailable until then."
-            )
-            KEYLESS_EXCHANGES.add(name.lower())
-            EXCHANGES[name] = None
-            ex = ensure_exchange(name)
-            if ex is not None:
-                try:
-                    tickers = with_retries(lambda: ex.fetch_tickers(params=params), name)
-                except Exception as e2:
-                    e = e2
-        if tickers is None:
-            log.warning(f"  WARNING  {name}: {str(e)[:800]}")
-            EXCHANGES[name] = None
-            return {}
+        log.warning(f"  WARNING  {name}: {str(e)[:800]}")
+        EXCHANGES[name] = None
+        return {}
     markets = getattr(ex, "markets", None) or {}
     result = {}
     for symbol, t in tickers.items():
@@ -585,10 +518,6 @@ def check_depth(r):
     sell_price, _, sell_ok = walk_book(bids, DEPTH_CHECK_USDT)
 
     r["depth_checked"] = True
-    # best level of the book actually fetched, to compare with the ticker price (a big
-    # difference means the ticker was stale or the book is not what the ticker showed)
-    r["buy_book_top"] = asks[0][0] if asks and len(asks[0]) >= 1 else None
-    r["sell_book_top"] = bids[0][0] if bids and len(bids[0]) >= 1 else None
     if buy_price is None or sell_price is None or buy_price <= 0:
         r["depth_ok"] = False
         return r
@@ -761,7 +690,6 @@ _CONTRACT_KEYS = (
     "tokenAddress",
     "token_address",
     "address",
-    "addr",
 )
 
 
@@ -778,25 +706,6 @@ def _extract_contract(network_data, currency_data=None):
     return None
 
 
-def _flatten_unified_fees(networks):
-    """
-    ccxt's unified fetchDepositWithdrawFee(s) nests the fee as
-    network["withdraw"]["fee"], but every consumer in this file reads
-    network["fee"]. Copy it up (fixed fees only, never a percentage).
-    """
-    out = {}
-    for code, data in networks.items():
-        data = dict(data)
-        if data.get("fee") is None:
-            w = data.get("withdraw")
-            if isinstance(w, dict) and not w.get("percentage"):
-                fee = _to_float(w.get("fee"))
-                if fee is not None:
-                    data["fee"] = fee
-        out[code] = data
-    return out
-
-
 def _fallback_networks(exchange_name, base):
     ex = ensure_exchange(exchange_name)
     if ex is None:
@@ -804,12 +713,10 @@ def _fallback_networks(exchange_name, base):
     try:
         if getattr(ex, "has", {}).get("fetchDepositWithdrawFee"):
             fee_data = ex.fetch_deposit_withdraw_fee(base)
-            return _flatten_unified_fees(_clean_networks_dict((fee_data or {}).get("networks") or {}))
+            return _clean_networks_dict((fee_data or {}).get("networks") or {})
         if getattr(ex, "has", {}).get("fetchDepositWithdrawFees"):
             fee_data = ex.fetch_deposit_withdraw_fees([base])
-            return _flatten_unified_fees(
-                _clean_networks_dict(((fee_data or {}).get(base) or {}).get("networks") or {})
-            )
+            return _clean_networks_dict(((fee_data or {}).get(base) or {}).get("networks") or {})
     except Exception as e:
         log.warning(
             f"  WARNING  {exchange_name} deposit/withdraw fee fallback for {base}: {str(e)[:400]}"
@@ -855,64 +762,27 @@ _GATE_WITHDRAW_INFO_TTL = 1800
 
 def _gate_chain_candidates(network_data, ccxt_code):
     """
-    Return every name Gate might use as a key for this network.
-
-    ccxt builds each network entry as {"id": <Gate chain name>, "network": <unified
-    code>, "info": <the raw chain dict>}, so the raw Gate chain name ("ETH", "BSC",
-    "TRX" ...) lives in network_data["id"] and info["name"] -- NOT in a nested
-    info["chains"] list. The old lookup only tried the unified code ("ERC20") and
-    info["chains"], so it never found the "ETH" key in withdraw_fix_on_chains and
-    fee/min stayed None.
+    Return every name Gate might use as a key for this network: the ccxt
+    unified code, plus each raw chain name stored inside info.chains.
     """
     out = []
     seen = set()
 
     def add(name):
-        if name and isinstance(name, str) and name not in seen:
+        if name and name not in seen:
             seen.add(name)
             out.append(name)
 
     add(ccxt_code)
     if isinstance(network_data, dict):
-        add(network_data.get("id"))
-        add(network_data.get("network"))
         info = network_data.get("info") or {}
-        if isinstance(info, dict):
-            add(info.get("name"))
-            add(info.get("chain"))
-            add(info.get("chain_name"))
-            chains = info.get("chains")
-            if isinstance(chains, list):
-                for c in chains:
-                    if isinstance(c, dict):
-                        add(c.get("name"))
-                        add(c.get("chain"))
+        chains = info.get("chains")
+        if isinstance(chains, list):
+            for c in chains:
+                if isinstance(c, dict):
+                    add(c.get("name"))
+        add(info.get("chain"))
     return out
-
-
-def _gate_match_chain(gate_map, network_data, ccxt_code, n_networks):
-    """
-    Find Gate's fee/min entry for one ccxt network:
-      1. exact chain-name match on any candidate
-      2. same network after normalize_network() (ERC20 == ETH, BEP20(BSC) == BSC ...)
-      3. the currency has exactly one chain on both sides
-    """
-    cands = _gate_chain_candidates(network_data, ccxt_code)
-    for cand in cands:
-        if cand in gate_map:
-            return gate_map[cand]
-
-    by_norm = defaultdict(list)
-    for key, val in gate_map.items():
-        by_norm[normalize_network(key)].append(val)
-    for cand in cands:
-        hits = by_norm.get(normalize_network(cand))
-        if hits:
-            return hits[0]
-
-    if len(gate_map) == 1 and n_networks == 1:
-        return next(iter(gate_map.values()))
-    return None
 
 
 def _gate_raw_withdraw_info(ex, base):
@@ -925,7 +795,7 @@ def _gate_raw_withdraw_info(ex, base):
 
     with _GATE_WITHDRAW_INFO_LOCK:
         cached = _GATE_WITHDRAW_INFO_CACHE.get(base_up)
-    if cached and (time.time() - cached["ts"]) < cached.get("ttl", _GATE_WITHDRAW_INFO_TTL):
+    if cached and (time.time() - cached["ts"]) < _GATE_WITHDRAW_INFO_TTL:
         return cached["data"]
 
     try:
@@ -944,10 +814,8 @@ def _gate_raw_withdraw_info(ex, base):
         log.warning(f"  WARNING  Gate withdraw_status({base_up}): {str(e)[:200]}")
         result = {}
 
-    # An empty result usually means a transient API failure -- do not pin it for 30 min.
-    ttl = _GATE_WITHDRAW_INFO_TTL if result else 60
     with _GATE_WITHDRAW_INFO_LOCK:
-        _GATE_WITHDRAW_INFO_CACHE[base_up] = {"ts": time.time(), "data": result, "ttl": ttl}
+        _GATE_WITHDRAW_INFO_CACHE[base_up] = {"ts": time.time(), "data": result}
     return result
 
 
@@ -961,7 +829,7 @@ def _parse_gate_withdraw_rows(rows, base_up):
             continue
 
         try:
-            log.debug(f"  [gate-raw] {base_up} withdraw_status keys: {sorted(row.keys())}")
+            log.info(f"  [gate-raw] {base_up} withdraw_status keys: {sorted(row.keys())}")
         except Exception:
             pass
 
@@ -1018,11 +886,14 @@ def _enrich_gate_fee_min(exchange_name, base, networks, pct_map):
     gate_map = _gate_raw_withdraw_info(gate_ex, base)
     if not gate_map:
         return
-    n_networks = sum(1 for d in networks.values() if isinstance(d, dict))
     for code, data in networks.items():
         if not isinstance(data, dict):
             continue
-        hit = _gate_match_chain(gate_map, data, code, n_networks)
+        hit = None
+        for cand in _gate_chain_candidates(data, code):
+            if cand in gate_map:
+                hit = gate_map[cand]
+                break
         if not hit:
             continue
         if data.get("fee") is None and hit["fee"] is not None:
@@ -1913,66 +1784,6 @@ def fmt_vol(v):
     else:                return f"${v:.0f}"
 
 
-def _execution_prices(r):
-    """
-    Prices the CAPITAL_USDT fill would really get: the order-book averages from
-    check_depth(), not the ticker's top-of-book. Returns (buy_px, sell_px, None) or
-    (None, None, reason).
-    """
-    if r.get("buy_depth_price") is None or r.get("sell_depth_price") is None:
-        return None, None, f"order book unavailable — cannot price a {DEPTH_CHECK_USDT} USDT fill"
-    if not r.get("depth_ok"):
-        return None, None, f"order book too thin to fill {DEPTH_CHECK_USDT} USDT on one side"
-    buy_px, sell_px = r["buy_depth_price"], r["sell_depth_price"]
-    if r.get("corrected_symbol"):
-        # the DEPTH sell price was measured on the wrong-token symbol
-        sell_px = r.get("corrected_sell_depth_price") or r.get("corrected_sell_price")
-        if not sell_px:
-            return None, None, "corrected-symbol sell price unavailable"
-    return buy_px, sell_px, None
-
-
-def _leg_depth_prices(buy_ex, sell_ex, symbol):
-    """Order-book prices for an alternative route (alt_ex legs have no depth data yet)."""
-    buy_venue, sell_venue = ensure_exchange(buy_ex), ensure_exchange(sell_ex)
-    if buy_venue is None or sell_venue is None:
-        return None, None, "exchange unavailable for the depth check"
-    buy_ob = _fetch_order_book_safe(buy_ex, buy_venue, symbol)
-    sell_ob = _fetch_order_book_safe(sell_ex, sell_venue, symbol)
-    if buy_ob is None or sell_ob is None:
-        return None, None, "order book unavailable — cannot price the fill"
-    buy_px, _, buy_ok = walk_book(_sort_book_side(buy_ob.get("asks", []) or [], "asks"), DEPTH_CHECK_USDT)
-    sell_px, _, sell_ok = walk_book(_sort_book_side(sell_ob.get("bids", []) or [], "bids"), DEPTH_CHECK_USDT)
-    if not buy_px or not sell_px:
-        return None, None, "order book empty on one side"
-    if not (buy_ok and sell_ok):
-        return None, None, f"order book too thin to fill {DEPTH_CHECK_USDT} USDT on one side"
-    return buy_px, sell_px, None
-
-
-def _price_and_store(symbol, buy_ex, sell_ex, buy_px, sell_px, problem,
-                     fee, fee_percent, min_withdrawal, network):
-    if problem:
-        log.info(f"       PROFIT not calculated — {problem}")
-        return None
-    buy_fees = get_taker_fee(buy_ex, symbol)
-    sell_fees = get_taker_fee(sell_ex, symbol)
-    profit = calc_arb_profit(
-        CAPITAL_USDT, buy_px, sell_px,
-        fee_tokens=fee,
-        fee_percent=fee_percent,
-        min_withdrawal_tokens=min_withdrawal,
-        buy_fees=buy_fees,
-        sell_fees=sell_fees,
-    )
-    if profit:
-        profit["buy_price_used"], profit["sell_price_used"] = buy_px, sell_px
-    log_profit_block(profit, symbol)
-    real_gap = ((sell_px - buy_px) / buy_px) * 100
-    maybe_store_arb_coin(symbol, real_gap, buy_ex, buy_px, sell_ex, sell_px, profit, network)
-    return profit
-
-
 def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
                     fee_percent=None,
                     min_withdrawal_tokens=None,
@@ -2031,7 +1842,6 @@ def calc_arb_profit(capital_usdt, buy_price, sell_price, fee_tokens=None,
         "gas_tokens_fixed": gas_tokens_fixed,
         "gas_tokens_percent": gas_tokens_percent,
         "fee_percent": fee_percent,
-        "fee_known": fee_tokens is not None or bool(fee_percent),
         "tokens_remaining": tokens_remaining,
         "sell_fees": sell_fees,
         "sell_fee_rate": sell_fee_rate,
@@ -2049,11 +1859,6 @@ def log_profit_block(profit, symbol=None):
         return
     base = symbol.split("/")[0] if symbol else "tokens"
     log.info(f"       PROFIT Capital= {profit['capital']:.0f}USDT")
-    if profit.get("buy_price_used") and profit.get("sell_price_used"):
-        log.info(
-            f"       PROFIT Priced at order-book avg: buy {fmt_price(profit['buy_price_used'])}  "
-            f"sell {fmt_price(profit['sell_price_used'])}"
-        )
     log.info(f"       PROFIT Tokens bought= {profit['tokens_bought']:.6f}")
     log.info(
         f"       PROFIT Buy taker fee ({profit['buy_fee_rate'] * 100:.4f}% "
@@ -2077,8 +1882,6 @@ def log_profit_block(profit, symbol=None):
             f"(+{profit['fee_percent']:.4f}% = -{profit['gas_tokens_percent']:.6f})"
         )
         log.info(f"       PROFIT Withdrawal fee total= -{profit['gas_tokens']:.6f}")
-    elif not profit.get("fee_known", True):
-        log.info("       PROFIT withdrawal fee UNKNOWN — counted as 0, so this profit is overstated (not stored)")
     else:
         log.info(f"       PROFIT withdrawal fee deducted= -{profit['gas_tokens']:.6f}")
     log.info(f"       PROFIT Tokens remaining= {profit['tokens_remaining']:.6f}")
@@ -2090,10 +1893,6 @@ def log_profit_block(profit, symbol=None):
     log.info(f"       PROFIT Total received= {profit['total_received']:.4f} USDT")
     log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
     log.info(f"       PROFIT ROI {profit['roi_pct']:+.2f}%")
-
-
-_LAST_INSERTED = {}
-_LAST_INSERTED_LOCK = threading.Lock()
 
 
 def store_arb_coin(
@@ -2111,15 +1910,6 @@ def store_arb_coin(
         existing = sb.table("arb_coins").select("id").eq("symbol", symbol).limit(1).execute()
         if existing.data:
             return
-        with _LAST_INSERTED_LOCK:
-            last = _LAST_INSERTED.get(symbol)
-        if last is not None and (time.time() - last) < REINSERT_COOLDOWN_SEC:
-            log.info(
-                f"       DB     ⏸ {symbol} was inserted {(time.time() - last) / 60:.0f}m ago and has "
-                f"since been removed by the analyzer — not re-inserting for "
-                f"{REINSERT_COOLDOWN_SEC // 60}m after the last insert"
-            )
-            return
         sb.table("arb_coins").insert({
             "symbol": symbol,
             "real_gap_pct": round(real_gap_pct, 4) if real_gap_pct is not None else None,
@@ -2130,8 +1920,6 @@ def store_arb_coin(
             "profit_usdt": round(profit_usdt, 4),
             "network": network,
         }).execute()
-        with _LAST_INSERTED_LOCK:
-            _LAST_INSERTED[symbol] = time.time()
         log.info(
             f"       DB     ✅ stored {symbol} in arb_coins  |  profit {profit_usdt:+.4f} USDT  |  "
             f"network {network}"
@@ -2151,9 +1939,6 @@ def maybe_store_arb_coin(
     network,
 ):
     if not profit or profit["net_pnl"] < MIN_STORE_PROFIT_USDT:
-        return
-    if not profit.get("fee_known", True):
-        log.info("       DB     ⏭ not stored — withdrawal fee unknown, profit would be overstated")
         return
     network_plain = (network or "").split(" (")[0]
     store_arb_coin(
@@ -2223,18 +2008,6 @@ def print_results(results, scan_num, duration, counts):
                     if r["depth_ok"]
                     else f"THIN (book ran out before {DEPTH_CHECK_USDT} USDT filled)"
                 )
-                if r["depth_gap_pct"] <= 0:
-                    status += " — NO EDGE at real fill prices"
-                for side, top, ticker, label in (
-                    ("buy", r.get("buy_book_top"), r["buy_price"], "ask"),
-                    ("sell", r.get("sell_book_top"), r["sell_price"], "bid"),
-                ):
-                    if top and ticker and abs(top - ticker) / ticker > 0.01:
-                        log.info(
-                            f"       BOOK   ⚠️ {side} side: order book best {label} {fmt_price(top)} vs "
-                            f"ticker {label} {fmt_price(ticker)} ({(top - ticker) / ticker * 100:+.1f}%) "
-                            "— ticker was stale or the book differs"
-                        )
                 log.info(
                     f"       DEPTH  buy avg {fmt_price(r['buy_depth_price'])}  "
                     f"sell avg {fmt_price(r['sell_depth_price'])}  "
@@ -2258,19 +2031,11 @@ def print_results(results, scan_num, duration, counts):
                     "pairing — ignore it, use this instead)"
                 )
             if r["verified"] is True:
-                if r["contract_match"] is True:
-                    basis = "contract address match"
-                elif r.get("name_match") is True:
-                    basis = f"name '{r['buy_name']}' on both"
-                else:
-                    no_name = [
-                        ex for ex, nm in ((r["buy_ex"], r["buy_name"]), (r["sell_ex"], r["sell_name"]))
-                        if not name_is_informative(nm, r["symbol"].split("/")[0])
-                    ]
-                    basis = (
-                        "network match only (no usable token name from "
-                        f"{', '.join(no_name) or 'either exchange'})"
-                    )
+                basis = (
+                    "contract address match"
+                    if r["contract_match"] is True
+                    else f"name '{r['buy_name']}' on both"
+                )
                 min_wd = r["withdrawal_min_tokens"]
                 pct = r.get("withdrawal_fee_percent")
                 fee_desc = (
@@ -2283,11 +2048,22 @@ def print_results(results, scan_num, duration, counts):
                     f"network {r['withdrawal_network']}  fee {fee_desc}  "
                     f"min_withdraw {min_wd if min_wd is not None else 'unknown'}"
                 )
-                buy_px, sell_px, problem = _execution_prices(r)
-                _price_and_store(
-                    r["symbol"], r["buy_ex"], r["sell_ex"], buy_px, sell_px, problem,
-                    r["withdrawal_fee"], r.get("withdrawal_fee_percent"),
-                    r["withdrawal_min_tokens"], r["withdrawal_network"],
+                buy_fees = get_taker_fee(r["buy_ex"], r["symbol"])
+                sell_fees = get_taker_fee(r["sell_ex"], r["symbol"])
+                profit = calc_arb_profit(
+                    CAPITAL_USDT, r["buy_price"], r["sell_price"],
+                    fee_tokens=r["withdrawal_fee"],
+                    fee_percent=r.get("withdrawal_fee_percent"),
+                    min_withdrawal_tokens=r["withdrawal_min_tokens"],
+                    buy_fees=buy_fees,
+                    sell_fees=sell_fees,
+                )
+                log_profit_block(profit, r["symbol"])
+                real_gap = r["depth_gap_pct"] if r["depth_gap_pct"] is not None else r["gap_pct"]
+                maybe_store_arb_coin(
+                    r["symbol"], real_gap, r["buy_ex"], r["buy_price"], r["sell_ex"],
+                    r["sell_price"],
+                    profit, r["withdrawal_network"],
                 )
             elif r["verified"] is False and r["alt_route"]:
                 ar = r["alt_route"]
@@ -2303,10 +2079,21 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['alt_ex']} → {ar['sell_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_px, sell_px, problem = _leg_depth_prices(ar["alt_ex"], r["sell_ex"], r["symbol"])
-                    _price_and_store(
-                        r["symbol"], ar["alt_ex"], r["sell_ex"], buy_px, sell_px, problem,
-                        ar.get("fee"), ar.get("fee_percent"), ar.get("min_withdrawal"), ar["network"],
+                    buy_fees = get_taker_fee(ar["alt_ex"], r["symbol"])
+                    sell_fees = get_taker_fee(r["sell_ex"], r["symbol"])
+                    profit = calc_arb_profit(
+                        CAPITAL_USDT, ar["alt_price"], r["sell_price"],
+                        fee_tokens=ar.get("fee"),
+                        fee_percent=ar.get("fee_percent"),
+                        min_withdrawal_tokens=ar.get("min_withdrawal"),
+                        buy_fees=buy_fees,
+                        sell_fees=sell_fees,
+                    )
+                    log_profit_block(profit, r["symbol"])
+                    maybe_store_arb_coin(
+                        r["symbol"], ar["gap_pct"], ar["alt_ex"], ar["alt_price"], r["sell_ex"],
+                        r["sell_price"],
+                        profit, ar["network"],
                     )
                 else:
                     log.info(
@@ -2317,10 +2104,21 @@ def print_results(results, scan_num, duration, counts):
                         f"       VERIFY  📉 Tradable at {ar['buy_ex']} → {ar['alt_ex']} | "
                         f"{ar['network']} 🚀"
                     )
-                    buy_px, sell_px, problem = _leg_depth_prices(r["buy_ex"], ar["alt_ex"], r["symbol"])
-                    _price_and_store(
-                        r["symbol"], r["buy_ex"], ar["alt_ex"], buy_px, sell_px, problem,
-                        ar.get("fee"), ar.get("fee_percent"), ar.get("min_withdrawal"), ar["network"],
+                    buy_fees = get_taker_fee(r["buy_ex"], r["symbol"])
+                    sell_fees = get_taker_fee(ar["alt_ex"], r["symbol"])
+                    profit = calc_arb_profit(
+                        CAPITAL_USDT, r["buy_price"], ar["alt_price"],
+                        fee_tokens=ar.get("fee"),
+                        fee_percent=ar.get("fee_percent"),
+                        min_withdrawal_tokens=ar.get("min_withdrawal"),
+                        buy_fees=buy_fees,
+                        sell_fees=sell_fees,
+                    )
+                    log_profit_block(profit, r["symbol"])
+                    maybe_store_arb_coin(
+                        r["symbol"], ar["gap_pct"], r["buy_ex"], r["buy_price"], ar["alt_ex"],
+                        ar["alt_price"],
+                        profit, ar["network"],
                     )
             elif r["verified"] is False:
                 if r["name_match"] is False:
@@ -2385,11 +2183,21 @@ def print_results(results, scan_num, duration, counts):
                             f"       VERIFY  ✅ Tradable via {cp['buy_ex']} → {cp['sell_ex']} | "
                             f"network {cp['tradable_network']} 🚀"
                         )
-                        buy_px, sell_px, problem = _leg_depth_prices(cp["buy_ex"], cp["sell_ex"], r["symbol"])
-                        _price_and_store(
-                            r["symbol"], cp["buy_ex"], cp["sell_ex"], buy_px, sell_px, problem,
-                            cp.get("fee"), cp.get("fee_percent"), cp.get("min_withdrawal"),
-                            cp["tradable_network"],
+                        buy_fees = get_taker_fee(cp["buy_ex"], r["symbol"])
+                        sell_fees = get_taker_fee(cp["sell_ex"], r["symbol"])
+                        profit = calc_arb_profit(
+                            CAPITAL_USDT, cp["buy_price"], cp["sell_price"],
+                            fee_tokens=cp.get("fee"),
+                            fee_percent=cp.get("fee_percent"),
+                            min_withdrawal_tokens=cp.get("min_withdrawal"),
+                            buy_fees=buy_fees,
+                            sell_fees=sell_fees,
+                        )
+                        log_profit_block(profit, r["symbol"])
+                        maybe_store_arb_coin(
+                            r["symbol"], cp["gap_pct"], cp["buy_ex"], cp["buy_price"],
+                            cp["sell_ex"], cp["sell_price"],
+                            profit, cp["tradable_network"],
                         )
                     else:
                         for msg in cp["blocked_msgs"]:
